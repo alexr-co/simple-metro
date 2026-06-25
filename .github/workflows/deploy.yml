@@ -1,0 +1,62 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+# id-token is needed for Workload Identity Federation (Firebase auth).
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  frontend:
+    name: Frontend → Firebase Hosting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      # Delete the lockfile + fresh npm install — workaround for npm bug #4828.
+      # The committed lockfile is generated on macOS/arm64; CI runs Ubuntu/x64.
+      # npm honors the lockfile's recorded optional deps and won't add the
+      # missing Linux platform binaries (Vite/rollup native, etc). Nuking the
+      # lockfile forces a fresh resolution that picks the right runner binaries.
+      - run: rm -f frontend/package-lock.json
+      - run: npm --prefix frontend install
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      # firebase.json's predeploy hook runs `npm --prefix frontend run build`
+      # before deploying. firebase-tools picks up the ADC credentials set by
+      # google-github-actions/auth automatically.
+      - run: npx firebase-tools deploy --only hosting --project alexr-co --non-interactive
+
+  worker:
+    name: Worker → Cloudflare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # wrangler-action installs wrangler and runs `wrangler deploy` in worker/.
+      # The WMATA_KEY secret is already stored in Cloudflare and persists across
+      # deploys, so it does not need to be set here.
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
+          command: deploy
