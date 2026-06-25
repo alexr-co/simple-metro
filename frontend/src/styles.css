@@ -232,6 +232,25 @@ body {
   z-index: 50;
   box-shadow: 0 10px 40px rgba(0,0,0,0.22);
 }
+/* Search box pinned to the top of the popover so it stays put while the
+   matching list scrolls beneath it. */
+.mx-searchwrap {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--card);
+  padding: 8px; border-bottom: 1.5px solid var(--rule-strong);
+}
+.mx-search {
+  width: 100%; box-sizing: border-box;
+  background: var(--paper); border: 1.5px solid var(--rule-strong); border-radius: 9px;
+  padding: 9px 12px;
+  font-family: var(--sign); font-size: 15px; color: var(--ink);
+}
+.mx-search::placeholder { color: var(--muted); }
+.mx-search:focus { outline: none; box-shadow: 0 0 0 3px var(--rule); }
+.mx-nomatch {
+  padding: 16px 14px; text-align: center;
+  font-family: var(--sign); font-size: 14px; color: var(--muted);
+}
 .mx-selectopt {
   display: block; width: 100%; text-align: left;
   padding: 11px 14px;

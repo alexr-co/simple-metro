@@ -5,7 +5,7 @@ import {
   type LineCode, type Station, type Train, type Incident,
 } from './lib/metro-data';
 import * as api from './lib/metro-api';
-import { parseStationSlug, stationFromSlug, stationPath } from './lib/urls';
+import { parseStationSlug, stationFromSlug, stationPath, SLUG_ALIASES } from './lib/urls';
 
 const REFRESH_MS = 10_000;
 const LS = { station: 'simply-wmata.station' };
@@ -79,8 +79,10 @@ function StationPicker({
   onChange: (name: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
   const wrapRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -96,11 +98,31 @@ function StationPicker({
     };
   }, [open]);
 
+  // On open: start with a clear query and focus the search box. On close: reset
+  // the query so the next open starts fresh.
   useEffect(() => {
-    if (!open || !menuRef.current) return;
+    if (!open) { setQuery(''); return; }
+    const id = requestAnimationFrame(() => inputRef.current?.focus());
+    return () => cancelAnimationFrame(id);
+  }, [open]);
+
+  // Only scroll the active option into view on a fresh, unfiltered open —
+  // once the user is typing, the list reorders to the matches anyway.
+  useEffect(() => {
+    if (!open || query || !menuRef.current) return;
     const active = menuRef.current.querySelector<HTMLElement>('.mx-selectopt.active');
     active?.scrollIntoView({ block: 'nearest' });
-  }, [open]);
+  }, [open, query]);
+
+  // Filter by station name, plus the short slug aliases (e.g. "dca" → Reagan,
+  // "iad" → Dulles) so the well-known shortcuts find their station too.
+  const q = query.trim().toLowerCase();
+  const filtered = q === ''
+    ? stations
+    : stations.filter((s) =>
+        s.name.toLowerCase().includes(q) ||
+        Object.entries(SLUG_ALIASES).some(
+          ([slug, name]) => name === s.name && slug.includes(q)));
 
   return (
     <div ref={wrapRef} className={'mx-selectwrap' + (open ? ' open' : '')}>
@@ -115,14 +137,33 @@ function StationPicker({
       </svg>
       {open && (
         <div ref={menuRef} className="mx-selectmenu" role="listbox">
-          {stations.map((s) => (
-            <button key={s.codes.join('-')} type="button" role="option"
-                    aria-selected={s.name === value}
-                    className={'mx-selectopt' + (s.name === value ? ' active' : '')}
-                    onClick={() => { onChange(s.name); setOpen(false); }}>
-              {s.name}
-            </button>
-          ))}
+          <div className="mx-searchwrap">
+            <input
+              ref={inputRef}
+              type="text"
+              className="mx-search"
+              placeholder="Search stations…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && filtered.length > 0) {
+                  onChange(filtered[0].name);
+                  setOpen(false);
+                }
+              }}
+              aria-label="Search stations"
+            />
+          </div>
+          {filtered.length === 0
+            ? <div className="mx-nomatch">No stations match “{query}”</div>
+            : filtered.map((s) => (
+                <button key={s.codes.join('-')} type="button" role="option"
+                        aria-selected={s.name === value}
+                        className={'mx-selectopt' + (s.name === value ? ' active' : '')}
+                        onClick={() => { onChange(s.name); setOpen(false); }}>
+                  {s.name}
+                </button>
+              ))}
         </div>
       )}
     </div>
