@@ -243,7 +243,9 @@ body {
   width: 100%; box-sizing: border-box;
   background: var(--paper); border: 1.5px solid var(--rule-strong); border-radius: 9px;
   padding: 9px 12px;
-  font-family: var(--sign); font-size: 15px; color: var(--ink);
+  /* 16px min: iOS Safari auto-zooms (and shifts the page) on focus of any
+     input smaller than 16px. */
+  font-family: var(--sign); font-size: 16px; color: var(--ink);
 }
 .mx-search::placeholder { color: var(--muted); }
 .mx-search:focus { outline: none; box-shadow: 0 0 0 3px var(--rule); }
@@ -263,6 +265,11 @@ body {
     position: fixed; inset: 0;
     max-height: none; border: none; border-radius: 0;
     box-shadow: none; z-index: 100;
+    /* Match the page (and the html overscroll color) so the bottom bounce
+       blends instead of revealing a paper seam behind the card. */
+    background: var(--paper);
+    overscroll-behavior: contain;
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
   }
   .mx-searchwrap {
     display: flex; align-items: center; gap: 10px;
