@@ -1,4 +1,4 @@
-# Simply WMATA
+# Simple Metro
 
 A fast, real-time arrivals board for the Washington DC Metro.
 **Live:** https://metro.alexr-co.com

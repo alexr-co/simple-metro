@@ -1,4 +1,4 @@
-/* Simply WMATA — board styles.
+/* Simple Metro — board styles.
    Mobile: full-bleed. Tablet/desktop (≥640px): centered card. */
 
 :root { --sign: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
