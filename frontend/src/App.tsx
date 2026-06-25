@@ -136,7 +136,13 @@ function StationPicker({
               fill="none" strokeLinecap="round" strokeLinejoin="round" />
       </svg>
       {open && (
-        <div ref={menuRef} className="mx-selectmenu" role="listbox">
+        <div ref={menuRef} className="mx-selectmenu" role="listbox"
+             // Dismiss the keyboard once the user starts dragging to scroll.
+             // touchmove (not scroll) so the programmatic scroll-into-view on
+             // open doesn't blur the autofocused search field.
+             onTouchMove={() => {
+               if (document.activeElement === inputRef.current) inputRef.current?.blur();
+             }}>
           <div className="mx-searchwrap">
             <input
               ref={inputRef}
