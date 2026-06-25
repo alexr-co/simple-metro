@@ -37,28 +37,14 @@ jobs:
           service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
 
       # firebase.json's predeploy hook runs `npm --prefix frontend run build`
-      # before deploying. firebase-tools picks up the ADC credentials set by
+      # before deploying. firebase-tools reads the ADC credentials exported by
       # google-github-actions/auth automatically.
       #
-      # Pinned to v14 (the root package.json range) on purpose: an unpinned
-      # `npx firebase-tools` fetches the latest (v15), which fails WIF/ADC auth
-      # with "Failed to authenticate, have you run firebase login?". v14 honors
-      # the ADC credentials exported above.
-      #
-      # Retry loop: the WIF -> firebase-tools ADC token exchange is
-      # intermittently flaky ("Failed to authenticate"). The deploy is
-      # idempotent, so a couple of retries make the job reliable.
-      - name: Deploy to Firebase Hosting
-        run: |
-          for attempt in 1 2 3; do
-            if npx -y firebase-tools@14 deploy --only hosting --project alexr-co --non-interactive; then
-              exit 0
-            fi
-            echo "::warning::Firebase deploy attempt $attempt failed; retrying in 10s…"
-            sleep 10
-          done
-          echo "::error::Firebase deploy failed after 3 attempts"
-          exit 1
+      # Pinned to 13.35.1 — the version proven to work with Workload Identity
+      # Federation on the alexr-co.com repo. v14/v15 reject the WIF
+      # external_account ADC file with "Failed to authenticate, have you run
+      # firebase login?"; v13 honors it.
+      - run: npx -y firebase-tools@13.35.1 deploy --only hosting --project alexr-co --non-interactive
 
   worker:
     name: Worker → Cloudflare
