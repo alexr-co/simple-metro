@@ -39,7 +39,12 @@ jobs:
       # firebase.json's predeploy hook runs `npm --prefix frontend run build`
       # before deploying. firebase-tools picks up the ADC credentials set by
       # google-github-actions/auth automatically.
-      - run: npx firebase-tools deploy --only hosting --project alexr-co --non-interactive
+      #
+      # Pinned to v14 (the root package.json range) on purpose: an unpinned
+      # `npx firebase-tools` fetches the latest (v15), which fails WIF/ADC auth
+      # with "Failed to authenticate, have you run firebase login?". v14 honors
+      # the ADC credentials exported above.
+      - run: npx -y firebase-tools@14 deploy --only hosting --project alexr-co --non-interactive
 
   worker:
     name: Worker → Cloudflare
