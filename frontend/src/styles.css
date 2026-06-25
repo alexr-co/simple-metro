@@ -247,9 +247,36 @@ body {
 }
 .mx-search::placeholder { color: var(--muted); }
 .mx-search:focus { outline: none; box-shadow: 0 0 0 3px var(--rule); }
+/* "Done" control — only shown in the mobile full-screen overlay below. */
+.mx-searchclose { display: none; }
 .mx-nomatch {
   padding: 16px 14px; text-align: center;
   font-family: var(--sign); font-size: 14px; color: var(--muted);
+}
+
+/* Mobile: a small popover anchored at the bottom gets buried by the on-screen
+   keyboard. Promote it to a full-screen search overlay so the search field and
+   the top results stay above the keyboard, with the list scrolling beneath the
+   pinned search bar. Desktop keeps the compact popover. */
+@media (max-width: 639px) {
+  .mx-selectmenu {
+    position: fixed; inset: 0;
+    max-height: none; border: none; border-radius: 0;
+    box-shadow: none; z-index: 100;
+  }
+  .mx-searchwrap {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px;
+    padding-top: max(10px, env(safe-area-inset-top));
+  }
+  .mx-search { flex: 1; }
+  .mx-searchclose {
+    display: inline-flex; flex-shrink: 0;
+    background: transparent; border: none;
+    padding: 8px 4px;
+    font-family: var(--sign); font-weight: 700; font-size: 15px;
+    color: var(--ink); cursor: pointer;
+  }
 }
 .mx-selectopt {
   display: block; width: 100%; text-align: left;

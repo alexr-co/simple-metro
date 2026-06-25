@@ -153,6 +153,12 @@ function StationPicker({
               }}
               aria-label="Search stations"
             />
+            {/* Dismiss control for the mobile full-screen overlay (hidden on
+                desktop, which closes via outside-click / Escape). */}
+            <button type="button" className="mx-searchclose"
+                    onClick={() => setOpen(false)} aria-label="Close station search">
+              Done
+            </button>
           </div>
           {filtered.length === 0
             ? <div className="mx-nomatch">No stations match “{query}”</div>
