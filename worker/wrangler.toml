@@ -1,0 +1,35 @@
+name = "metro-arrivals-api"
+main = "src/index.ts"
+compatibility_date = "2026-06-06"
+
+# Strongly consistent global cache for the pre-warmed WMATA snapshot.
+# Pinned to enam in code (locationHint) — keeps reads fast for DC-area
+# users and minimizes round-trip to WMATA's own infrastructure.
+[[durable_objects.bindings]]
+name = "WMATA_DO"
+class_name = "WmataCache"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WmataCache"]
+
+# Scheduled pre-warm:
+#   "* * * * *"      → predictions, every minute (fans out to 3 fetches inside
+#                       the handler for effective 20s polling)
+#   "*/5 * * * *"    → incidents, every 5 minutes (incidents change rarely)
+#   "17 6 * * *"     → station list, once daily (essentially static)
+[triggers]
+crons = ["* * * * *", "*/5 * * * *", "17 6 * * *"]
+
+# WMATA_KEY is a Secret (set via `wrangler secret put WMATA_KEY`).
+
+# Route binding: Cloudflare intercepts metro.alexr-co.com/api/* at the edge
+# and dispatches to this Worker. Non-/api paths fall through to Firebase
+# Hosting (which serves the SPA). Requires the DNS record for metro on
+# alexr-co.com to be Proxied (orange cloud) in Cloudflare.
+[[routes]]
+pattern = "metro.alexr-co.com/api/*"
+zone_name = "alexr-co.com"
+
+[observability]
+enabled = true

@@ -1,0 +1,19 @@
+{
+  "name": "simple-wmata",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Simply WMATA — Metro arrivals board. Frontend on Firebase Hosting, WMATA proxy on a Cloudflare Worker.",
+  "scripts": {
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:worker": "npm --prefix worker run dev",
+    "build:frontend": "npm --prefix frontend run build",
+    "typecheck:worker": "npm --prefix worker run typecheck",
+    "deploy:frontend": "npm --prefix frontend run build && firebase deploy --only hosting",
+    "deploy:worker": "npm --prefix worker run deploy",
+    "deploy": "npm run deploy:frontend && npm run deploy:worker",
+    "tail:worker": "npm --prefix worker run tail"
+  },
+  "devDependencies": {
+    "firebase-tools": "^14.0.0"
+  }
+}

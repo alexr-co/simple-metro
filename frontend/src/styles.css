@@ -1,0 +1,282 @@
+/* Simply WMATA — board styles.
+   Mobile: full-bleed. Tablet/desktop (≥640px): centered card. */
+
+:root { --sign: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+/* <html> background shows during iOS Safari overscroll bounce above/below
+   <body>. Match it to .mx-root's paper color so the bounce blends in. */
+html { background: #efece4; }
+body {
+  margin: 0;
+  font-family: var(--sign);
+  -webkit-font-smoothing: antialiased;
+  background: radial-gradient(120% 90% at 50% 0%, #d9d7d0 0%, #c4c2bb 55%, #b6b4ad 100%);
+  color: #16140d;
+}
+@media (prefers-color-scheme: dark) {
+  html { background: #100f0b; }
+  body {
+    background: radial-gradient(120% 90% at 50% 0%, #1f1d16 0%, #100f0b 100%);
+    color: #f3efe3;
+  }
+}
+
+#root { min-height: 100%; display: flex; }
+
+/* ── theme tokens ── */
+.mx-root {
+  --paper: #efece4;
+  --card: #fbfaf6;
+  --ink: #16140d;
+  --muted: rgba(22,20,13,0.52);
+  --rule: rgba(22,20,13,0.13);
+  --rule-strong: #16140d;
+  --warn: #f2c300;
+  --good: #00a94f;
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  flex: 1; display: flex; flex-direction: column;
+  background: var(--paper); color: var(--ink);
+  font-family: var(--sign);
+  position: relative; overflow: hidden;
+  min-height: 100dvh;
+}
+.mx-root[data-theme="dark"] {
+  --paper: #100f0b;
+  --card: #1a1812;
+  --ink: #f3efe3;
+  --muted: rgba(243,239,227,0.55);
+  --rule: rgba(243,239,227,0.14);
+  --rule-strong: #f3efe3;
+}
+
+/* ≥640px: center as a card. The gradient body shows around it. */
+@media (min-width: 640px) {
+  #root { align-items: center; justify-content: center; padding: 24px; }
+  .mx-root {
+    flex: none;
+    width: 100%;
+    max-width: 600px;
+    height: min(880px, calc(100dvh - 48px));
+    min-height: 0;
+    border-radius: 28px;
+    box-shadow:
+      0 30px 80px rgba(0,0,0,0.22),
+      0 0 0 1px rgba(0,0,0,0.06);
+  }
+}
+
+/* ── selected station ── */
+.mx-station {
+  padding:
+    max(18px, env(safe-area-inset-top))
+    max(24px, env(safe-area-inset-right))
+    14px
+    max(24px, env(safe-area-inset-left));
+}
+@media (min-width: 640px) {
+  .mx-station { padding: 22px 26px 14px; }
+}
+.mx-stationhead { display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.mx-stationName {
+  margin: 0; font-weight: 800; font-size: 26px; line-height: 1.04;
+  letter-spacing: -0.6px; text-wrap: pretty;
+}
+.mx-tiles {
+  display: flex; gap: 5px; flex-shrink: 0; flex-wrap: wrap;
+  margin-top: 5px;
+}
+.mx-tile {
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 5px; font-family: var(--sign); font-weight: 800;
+  font-size: 12px; flex-shrink: 0;
+}
+.mx-live {
+  display: flex; align-items: center; gap: 6px; margin-top: 12px;
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--muted); white-space: nowrap;
+}
+.mx-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+.mx-dot.live { background: var(--good); animation: mxpulse 2s ease-out infinite; }
+.mx-dot.demo { background: #e07a00; }
+.mx-dot.loading { background: var(--muted); animation: mxblink 1s steps(2) infinite; }
+.mx-srclabel { color: var(--ink); font-weight: 600; }
+.mx-livesep { opacity: 0.5; }
+.mx-srcbtn {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: transparent; border: none; padding: 0; cursor: pointer;
+  font: inherit; color: inherit; letter-spacing: inherit; text-transform: inherit;
+}
+.mx-srcbtn:hover .mx-srclabel { color: var(--muted); }
+.mx-refresh {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; border: none; background: transparent;
+  color: var(--muted); cursor: pointer; border-radius: 50%; flex-shrink: 0;
+}
+.mx-refresh:hover { color: var(--ink); background: var(--rule); }
+.mx-refresh svg { display: block; animation: mxspin 0.6s ease; }
+@keyframes mxspin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+
+/* ── board ── */
+.mx-board { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+.mx-plat-block { border-top: 1.5px solid var(--rule-strong); }
+
+.mx-row {
+  position: relative; display: flex; align-items: center; gap: 12px;
+  padding: 0
+    max(24px, env(safe-area-inset-right))
+    0
+    max(24px, env(safe-area-inset-left));
+  height: 50px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--paper);
+}
+/* .mx-railaccent stays in the DOM but never shows. Earlier the first row in
+   each platform group got a colored stripe on the left; we now keep that
+   space empty so all rows read uniformly. */
+.mx-railaccent { position: absolute; left: 0; top: 0; bottom: 0; width: 4px; opacity: 0; }
+.mx-rowmid { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.mx-dest {
+  font-weight: 700; font-size: 17px; letter-spacing: -0.2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mx-cars {
+  font-family: var(--mono); font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.1em; color: var(--muted);
+}
+.mx-min {
+  font-family: var(--mono); display: flex; align-items: baseline;
+  justify-content: flex-end; min-width: 66px; flex-shrink: 0;
+}
+.mx-minnum { font-size: 30px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -1px; }
+.mx-minunit { font-size: 9.5px; font-weight: 600; text-transform: uppercase; margin-left: 3px; color: var(--muted); letter-spacing: 0.06em; }
+.mx-minword { font-family: var(--mono); font-size: 30px; font-weight: 700; line-height: 1; letter-spacing: -1px; }
+.mx-minword.dim { color: var(--muted); }
+.mx-row.lead .mx-minword { color: var(--good); }
+
+.mx-empty { padding: 14px 20px; color: var(--muted); font-size: 13px; }
+.mx-loading { padding: 26px 20px; color: var(--muted); font-family: var(--mono); font-size: 13px; }
+
+/* Whole-board empty state (closure, end-of-service, transient hiccup) plus
+   inline alert text when WMATA has something to say about it. */
+.mx-noarrivals {
+  padding: 30px max(24px, env(safe-area-inset-left));
+  display: flex; flex-direction: column; gap: 18px;
+}
+.mx-noarrivals-title {
+  font-family: var(--mono); font-size: 13px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+}
+.mx-noarrivals-alerts { display: flex; flex-direction: column; gap: 12px; }
+.mx-noarrivals-alert {
+  display: flex; align-items: flex-start; gap: 9px;
+  font-size: 13px; line-height: 1.45; color: var(--ink); opacity: 0.82;
+}
+.mx-noarrivals-alert svg { flex-shrink: 0; margin-top: 2px; }
+
+/* ── service alerts ── */
+.mx-alertbox { margin-top: 11px; }
+.mx-alerttoggle {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  background: transparent; border: none; padding: 0; cursor: pointer;
+  font-family: var(--mono); font-weight: 600; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);
+}
+.mx-alerttoggle:hover { color: var(--ink); }
+.mx-tri { flex-shrink: 0; }
+.mx-alertcount { flex: 1; text-align: left; }
+.mx-alertchev { color: var(--muted); transition: transform 0.2s; flex-shrink: 0; }
+.mx-alertbox.open .mx-alertchev { transform: rotate(180deg); }
+.mx-alertlist {
+  display: flex; flex-direction: column; gap: 9px;
+  margin-top: 10px; padding-left: 20px;
+}
+.mx-alerttext { font-size: 12px; line-height: 1.42; color: var(--ink); opacity: 0.74; }
+
+/* ── picker ── */
+.mx-picker {
+  border-top: 1.5px solid var(--rule-strong); background: var(--paper);
+  padding:
+    13px
+    max(20px, env(safe-area-inset-right))
+    max(22px, env(safe-area-inset-bottom))
+    max(20px, env(safe-area-inset-left));
+  display: flex; flex-direction: column; gap: 6px;
+}
+.mx-pickerlabel { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.16em; color: var(--muted); }
+.mx-selectwrap { position: relative; }
+.mx-select {
+  width: 100%; appearance: none; -webkit-appearance: none;
+  background: var(--card); border: 1.5px solid var(--rule-strong); border-radius: 12px;
+  padding: 14px 42px 14px 14px; font-family: var(--sign); font-weight: 700;
+  font-size: 16px; color: var(--ink); cursor: pointer;
+  text-align: left;
+}
+.mx-select:focus { outline: none; box-shadow: 0 0 0 3px var(--rule); }
+.mx-chev {
+  position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+  color: var(--ink); pointer-events: none; transition: transform 0.2s;
+}
+.mx-selectwrap.open .mx-chev { transform: translateY(-50%) rotate(180deg); }
+
+/* Bounded popover so the picker can't sprawl to viewport height. Opens
+   upward because the picker sits at the bottom of the card. */
+.mx-selectmenu {
+  position: absolute; bottom: calc(100% + 6px); left: 0; right: 0;
+  background: var(--card);
+  border: 1.5px solid var(--rule-strong);
+  border-radius: 12px;
+  max-height: 320px; overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  z-index: 50;
+  box-shadow: 0 10px 40px rgba(0,0,0,0.22);
+}
+.mx-selectopt {
+  display: block; width: 100%; text-align: left;
+  padding: 11px 14px;
+  background: transparent; border: none;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--sign); font-weight: 500; font-size: 15px;
+  color: var(--ink); cursor: pointer;
+}
+.mx-selectopt:hover { background: var(--rule); }
+.mx-selectopt.active { font-weight: 700; background: var(--rule); }
+.mx-selectopt:last-child { border-bottom: none; }
+
+/* ── key sheet ── */
+.mx-scrim {
+  position: absolute; inset: 0; background: rgba(0,0,0,0.42);
+  display: flex; align-items: flex-end; z-index: 80; animation: mxfade 0.18s ease;
+}
+.mx-sheet {
+  width: 100%; background: var(--paper); color: var(--ink);
+  border-radius: 22px 22px 0 0;
+  padding:
+    8px
+    max(20px, env(safe-area-inset-right))
+    max(24px, env(safe-area-inset-bottom))
+    max(20px, env(safe-area-inset-left));
+  box-shadow: 0 -10px 40px rgba(0,0,0,0.25);
+  animation: mxslideup 0.24s cubic-bezier(.2,.7,.2,1);
+}
+.mx-sheet-grip { width: 38px; height: 5px; border-radius: 3px; background: var(--rule-strong); opacity: 0.28; margin: 4px auto 14px; }
+.mx-sheet-title { font-weight: 800; font-size: 20px; letter-spacing: -0.3px; }
+.mx-sheet-sub { font-size: 13px; color: var(--muted); margin: 6px 0 15px; line-height: 1.45; }
+.mx-input {
+  width: 100%; background: var(--card); border: 1.5px solid var(--rule-strong);
+  border-radius: 12px; padding: 13px 14px; font-family: var(--mono);
+  font-size: 14px; color: var(--ink);
+}
+.mx-input:focus { outline: none; box-shadow: 0 0 0 3px var(--rule); }
+.mx-sheet-actions { display: flex; gap: 10px; margin-top: 14px; }
+.mx-btn { flex: 1; padding: 13px; border-radius: 12px; font-weight: 700; font-size: 15px; cursor: pointer; border: 1.5px solid var(--rule-strong); font-family: var(--sign); }
+.mx-btn.solid { background: var(--ink); color: var(--paper); }
+.mx-btn.ghost { background: transparent; color: var(--ink); }
+.mx-sheet-link { display: block; margin-top: 16px; font-size: 12px; color: var(--muted); text-decoration: none; font-family: var(--mono); }
+.mx-sheet-link:hover { color: var(--ink); }
+
+@keyframes mxpulse { 0% { box-shadow: 0 0 0 0 rgba(0,169,79,0.5); } 70% { box-shadow: 0 0 0 6px rgba(0,169,79,0); } 100% { box-shadow: 0 0 0 0 rgba(0,169,79,0); } }
+@keyframes mxblink { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
+@keyframes mxfade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes mxslideup { from { transform: translateY(100%); } to { transform: translateY(0); } }
