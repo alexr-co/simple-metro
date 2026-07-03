@@ -1,4 +1,4 @@
-/* Line palette, station list, demo data. ES module — no globals. */
+/* Line palette and station list. ES module — no globals. */
 
 export type LineCode = 'RD' | 'OR' | 'SV' | 'BL' | 'YL' | 'GR';
 
@@ -140,59 +140,3 @@ export const STATIONS: Station[] = [
   S('Suitland',               ['F10'], ['GR']),
   S('Branch Ave',             ['F11'], ['GR']),
 ];
-
-const TERMINALS: Record<LineCode, string[]> = {
-  RD: ['Shady Grove', 'Glenmont'],
-  OR: ['Vienna', 'New Carrollton'],
-  SV: ['Ashburn', 'Downtown Largo'],
-  BL: ['Franconia', 'Downtown Largo'],
-  YL: ['Huntington', 'Mt Vernon Sq'],
-  GR: ['Branch Ave', 'Greenbelt'],
-};
-
-// Park-Miller PRNG so the demo board doesn't reshuffle wildly every tick.
-function rng(seed: number): () => number {
-  let s = seed % 2147483647;
-  if (s <= 0) s += 2147483646;
-  return () => (s = (s * 16807) % 2147483647) / 2147483647;
-}
-
-// Demo predictions grouped per platform = station code + direction, so
-// multi-code transfer stations show all four platforms.
-export function demoPredictions(station: Station, tickSeed: number): Train[] {
-  const rand = rng((tickSeed || 1) + station.name.length * 7);
-  const lines = station.lines.length ? station.lines : (['RD'] as LineCode[]);
-  const trains: Train[] = [];
-  station.codes.forEach((code, ci) => {
-    ([1, 2] as const).forEach((group) => {
-      let prev = group === 1 ? 1 : 2;
-      const n = 2 + Math.floor(rand() * 2);
-      for (let i = 0; i < n; i++) {
-        const line = lines[Math.floor(rand() * lines.length)];
-        const terms = TERMINALS[line] ?? ['Downtown'];
-        const dest = terms[(group - 1 + i) % terms.length];
-        let min: string;
-        if (i === 0 && ci === 0 && group === 1 && rand() > 0.6) min = 'BRD';
-        else if (i === 0 && rand() > 0.7) min = 'ARR';
-        else { prev += 1 + Math.floor(rand() * 5); min = String(prev); }
-        trains.push({
-          line, dest, destCode: null,
-          cars: rand() > 0.5 ? '8' : '6',
-          min, group: String(group), loc: code,
-        });
-      }
-    });
-  });
-  return trains;
-}
-
-export function demoIncidents(station: Station): Incident[] {
-  if (!station.lines.length) return [];
-  if ((station.name.charCodeAt(0) + station.name.length) % 4 !== 0) return [];
-  const line = station.lines[0];
-  return [{
-    lines: [line],
-    type: 'Delay',
-    text: `${LINES[line].name} Line: trains are single-tracking near ${station.name}; expect waits up to 10 minutes.`,
-  }];
-}

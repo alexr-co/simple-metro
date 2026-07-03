@@ -2,14 +2,26 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import {
   LINES, STATIONS as FALLBACK_STATIONS,
-  demoPredictions, demoIncidents,
   type LineCode, type Station, type Train, type Incident,
 } from './lib/metro-data';
 import * as api from './lib/metro-api';
 import { parseStationSlug, stationFromSlug, stationPath, SLUG_ALIASES } from './lib/urls';
 
 const REFRESH_MS = 10_000;
+// How old the last successful fetch may get before we stop trusting the board
+// and show an "unable to load" state instead of stale arrivals.
+const STALE_MS = 120_000;
 const LS = { station: 'simply-wmata.station' };
+
+// Connection status shown in the header pill and the info sheet:
+//   loading      — first fetch for this station still in flight, no data yet
+//   live         — last fetch succeeded and the data is fresh
+//   reconnecting — a refresh failed but the last good data is still recent
+//   error        — no data yet, or the last good data is older than STALE_MS
+type Status = 'loading' | 'live' | 'reconnecting' | 'error';
+const STATUS_LABEL: Record<Status, string> = {
+  loading: 'Connecting', live: 'Live', reconnecting: 'Reconnecting', error: 'Offline',
+};
 
 // ── helpers ───────────────────────────────────────────────────
 const minRank = (m: string): number => {
@@ -218,11 +230,11 @@ function StationPicker({
 
 // ── data-source / debug sheet ─────────────────────────────────
 // The API key lives on the backend now, so the sheet just explains where the
-// data is coming from. Kept as a tap target on the "Live/Demo" label so we have
-// a place to surface backend status if needed later.
-function InfoSheet({ open, source, onClose }: {
+// data is coming from and the current connection status. Kept as a tap target
+// on the header status pill.
+function InfoSheet({ open, status, onClose }: {
   open: boolean;
-  source: 'live' | 'demo' | 'loading';
+  status: Status;
   onClose: () => void;
 }) {
   if (!open) return null;
@@ -232,10 +244,12 @@ function InfoSheet({ open, source, onClose }: {
         <div className="mx-sheet-grip" />
         <div className="mx-sheet-title">Data source</div>
         <div className="mx-sheet-sub">
-          {source === 'live'
+          {status === 'live'
             ? 'Live arrivals from the WMATA Rail API, served via the metro.alexr-co.com backend.'
-            : source === 'demo'
-            ? 'Backend unreachable — falling back to deterministic demo data. Live arrivals will resume automatically.'
+            : status === 'reconnecting'
+            ? 'Couldn’t reach the backend on the last try — showing the most recent arrivals and retrying automatically.'
+            : status === 'error'
+            ? 'Can’t reach the backend, and the last arrivals are too old to trust. Retrying automatically.'
             : 'Connecting to the WMATA backend…'}
         </div>
         <div className="mx-sheet-actions">
@@ -278,8 +292,11 @@ export default function App() {
   });
   const [trains, setTrains] = useState<Train[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
-  const [source, setSource] = useState<'loading' | 'live' | 'demo'>('loading');
-  const [updatedAt, setUpdatedAt] = useState<number>(Date.now());
+  // Timestamp of the last successful fetch for the current station (null = none
+  // yet), and whether the most recent attempt failed. Status is derived from
+  // these — see below. On failure we keep the last-good trains/incidents.
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+  const [failing, setFailing] = useState(false);
   const [, setNowTick] = useState(0);
   const [sheet, setSheet] = useState(false);
   const [alertsOpen, setAlertsOpen] = useState(false);
@@ -308,21 +325,23 @@ export default function App() {
       if (id !== reqId.current) return;
       setTrains(tr);
       setIncidents(inc.filter((i) => i.lines.some((l) => station.lines.includes(l))));
-      setSource('live');
       setUpdatedAt(Date.now());
-      return;
+      setFailing(false);
     } catch {
+      // Keep the last-good trains/incidents on screen; just flag the failure.
+      // Staleness (updatedAt aging past STALE_MS) decides when to hide them.
       if (id !== reqId.current) return;
-      const seed = Math.floor(Date.now() / REFRESH_MS);
-      setTrains(demoPredictions(station, seed));
-      setIncidents(demoIncidents(station));
-      setSource('demo');
-      setUpdatedAt(Date.now());
+      setFailing(true);
     }
   }, [station]);
 
   useEffect(() => {
-    setSource('loading');
+    // New station: drop the previous station's data so a failed first load
+    // shows the loading/error state rather than the wrong station's arrivals.
+    setTrains([]);
+    setIncidents([]);
+    setUpdatedAt(null);
+    setFailing(false);
     load();
     const iv = setInterval(load, REFRESH_MS);
     return () => clearInterval(iv);
@@ -389,10 +408,22 @@ export default function App() {
   });
   const groupKeys = Object.keys(groups).sort();
 
-  const elapsed = Math.floor((Date.now() - updatedAt) / 1000);
-  const agoText = source === 'loading' ? 'updating…'
-    : elapsed < 2 ? 'updated just now'
-    : `updated ${elapsed}s ago`;
+  // Derive the connection status from the last success + last-attempt flag.
+  // The 1s ticker above re-renders every second, so once `updatedAt` ages past
+  // STALE_MS this flips to 'error' on its own — no separate timer needed.
+  const age = updatedAt == null ? Infinity : Date.now() - updatedAt;
+  const status: Status =
+    updatedAt == null ? (failing ? 'error' : 'loading')
+    : age >= STALE_MS   ? 'error'
+    : failing           ? 'reconnecting'
+    : 'live';
+
+  const elapsed = updatedAt == null ? null : Math.floor((Date.now() - updatedAt) / 1000);
+  const agoText =
+    elapsed == null ? (failing ? 'no data' : 'updating…')
+    : elapsed < 2   ? 'updated just now'
+    : elapsed < 60  ? `updated ${elapsed}s ago`
+    : `updated ${Math.floor(elapsed / 60)}m ago`;
 
   return (
     <div className="mx-root" data-theme={dark ? 'dark' : 'light'}>
@@ -406,8 +437,8 @@ export default function App() {
         </div>
         <div className="mx-live">
           <button className="mx-srcbtn" onClick={() => setSheet(true)} title="Data source">
-            <span className={'mx-dot ' + source} />
-            <span className="mx-srclabel">{source === 'demo' ? 'Demo' : 'Live'}</span>
+            <span className={'mx-dot ' + status} />
+            <span className="mx-srclabel">{STATUS_LABEL[status]}</span>
           </button>
           <span className="mx-livesep">·</span>
           <span className="mx-ago">{agoText}</span>
@@ -422,7 +453,7 @@ export default function App() {
         {/* Header alerts are collapsible context when there ARE trains. When
             the board is empty (closure/end-of-service/etc.), alerts move down
             into the empty-state block so they're immediately visible there. */}
-        {incidents.length > 0 && trains.length > 0 && (
+        {incidents.length > 0 && trains.length > 0 && status !== 'error' && (
           <div className={'mx-alertbox' + (alertsOpen ? ' open' : '')}>
             <button className="mx-alerttoggle" onClick={() => setAlertsOpen((o) => !o)}>
               <svg className="mx-tri" width="13" height="13" viewBox="0 0 18 18">
@@ -449,14 +480,23 @@ export default function App() {
       </section>
 
       <main className="mx-board">
-        {source === 'loading' && trains.length === 0 && (
+        {status === 'loading' && (
           <div className="mx-loading">Loading arrivals…</div>
+        )}
+        {/* Too stale / never loaded: hide the arrivals (they'd be misleading)
+            and say so. The refresh loop keeps retrying, so this clears itself
+            once the backend is reachable again. */}
+        {status === 'error' && (
+          <div className="mx-noarrivals mx-loaderror">
+            <div className="mx-noarrivals-title">Unable to load train data</div>
+            <div className="mx-loaderror-sub">Check your connection — retrying automatically.</div>
+          </div>
         )}
         {/* Empty-state: all platforms returned no trains. Could be a closure,
             end of service hours, or a transient hiccup. If incidents apply to
             this station's lines, render their text inline so the user sees
             the explanation without tapping. */}
-        {source !== 'loading' && groupKeys.length === 0 && (
+        {(status === 'live' || status === 'reconnecting') && groupKeys.length === 0 && (
           <div className="mx-noarrivals">
             <div className="mx-noarrivals-title">No arrivals at this station</div>
             {incidents.length > 0 && (
@@ -475,7 +515,8 @@ export default function App() {
             )}
           </div>
         )}
-        {groupKeys.map((g) => <Platform key={g} trains={groups[g]} />)}
+        {(status === 'live' || status === 'reconnecting') &&
+          groupKeys.map((g) => <Platform key={g} trains={groups[g]} />)}
       </main>
 
       <footer className="mx-picker">
@@ -483,7 +524,7 @@ export default function App() {
         <StationPicker stations={stations} value={stationName} onChange={pickStation} />
       </footer>
 
-      <InfoSheet open={sheet} source={source} onClose={() => setSheet(false)} />
+      <InfoSheet open={sheet} status={status} onClose={() => setSheet(false)} />
     </div>
   );
 }

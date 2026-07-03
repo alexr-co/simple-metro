@@ -34,6 +34,7 @@ body {
   --rule-strong: #16140d;
   --warn: #f2c300;
   --good: #00a94f;
+  --bad: #e5484d;
   --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
   flex: 1; display: flex; flex-direction: column;
@@ -99,7 +100,8 @@ body {
 }
 .mx-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
 .mx-dot.live { background: var(--good); animation: mxpulse 2s ease-out infinite; }
-.mx-dot.demo { background: #e07a00; }
+.mx-dot.reconnecting { background: #e07a00; animation: mxblink 1s steps(2) infinite; }
+.mx-dot.error { background: var(--bad); }
 .mx-dot.loading { background: var(--muted); animation: mxblink 1s steps(2) infinite; }
 .mx-srclabel { color: var(--ink); font-weight: 600; }
 .mx-livesep { opacity: 0.5; }
@@ -174,6 +176,11 @@ body {
   font-size: 13px; line-height: 1.45; color: var(--ink); opacity: 0.82;
 }
 .mx-noarrivals-alert svg { flex-shrink: 0; margin-top: 2px; }
+
+/* Connection-error variant of the empty state: red accent on the title, with a
+   secondary line explaining we're retrying. */
+.mx-loaderror .mx-noarrivals-title { color: var(--bad); }
+.mx-loaderror-sub { font-size: 13px; line-height: 1.45; color: var(--muted); }
 
 /* ── service alerts ── */
 .mx-alertbox { margin-top: 11px; }
