@@ -437,7 +437,9 @@ export default function App() {
         </div>
         <div className="mx-live">
           <button className="mx-srcbtn" onClick={() => setSheet(true)} title="Data source">
-            <span className={'mx-dot ' + status} />
+            {/* Slot matches the alert triangle's width so the "LIVE" label and
+                the "SERVICE ALERT" label share the same left edge. */}
+            <span className="mx-doticon"><span className={'mx-dot ' + status} /></span>
             <span className="mx-srclabel">{STATUS_LABEL[status]}</span>
           </button>
           <span className="mx-livesep">·</span>

@@ -98,6 +98,9 @@ body {
   font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em;
   text-transform: uppercase; color: var(--muted); white-space: nowrap;
 }
+/* Fixed slot equal to the alert triangle's width (13px) so the status label
+   lines up with the "SERVICE ALERT" label below it. Dot sits left-aligned. */
+.mx-doticon { display: inline-flex; align-items: center; width: 13px; flex-shrink: 0; }
 .mx-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
 .mx-dot.live { background: var(--good); animation: mxpulse 2s ease-out infinite; }
 .mx-dot.reconnecting { background: #e07a00; animation: mxblink 1s steps(2) infinite; }
@@ -106,7 +109,7 @@ body {
 .mx-srclabel { color: var(--ink); font-weight: 600; }
 .mx-livesep { opacity: 0.5; }
 .mx-srcbtn {
-  display: inline-flex; align-items: center; gap: 6px;
+  display: inline-flex; align-items: center; gap: 7px;
   background: transparent; border: none; padding: 0; cursor: pointer;
   font: inherit; color: inherit; letter-spacing: inherit; text-transform: inherit;
 }
