@@ -97,6 +97,19 @@ const NAME_OVERRIDES_BY_CODE: Record<string, string> = {
   N10: 'Dulles International Airport',  // was: "Washington Dulles International Airport"
 };
 
+// Re-apply the code-keyed overrides to an already-adapted station list.
+// adaptStations applies them when it builds the snapshot, but the Durable Object
+// snapshot is only rebuilt on the daily cron — so a newly deployed override
+// wouldn't reach users for up to a day. Re-applying on the read path lets an
+// override change take effect immediately against whatever snapshot is cached.
+// Idempotent: on a fresh snapshot the names already match, so it's a no-op.
+function applyNameOverrides(stations: Station[]): Station[] {
+  return stations.map((s) => {
+    const override = s.codes.map((code) => NAME_OVERRIDES_BY_CODE[code]).find(Boolean);
+    return override && override !== s.name ? { ...s, name: override } : s;
+  });
+}
+
 function adaptStations(raw: RawStation[]): Station[] {
   const byName = new Map<string, Station>();
   for (const st of raw) {
@@ -271,7 +284,8 @@ async function refreshPredictions(env: Env): Promise<Train[]> {
   let fuzzyIndex: StationFuzzy[] = [];
   try {
     const cached = await c.getStations();
-    const stations = (cached && cached.length > 0) ? cached : await refreshStations(env);
+    const stations = applyNameOverrides(
+      (cached && cached.length > 0) ? cached : await refreshStations(env));
     for (const s of stations) {
       for (const code of s.codes) codeToName.set(code, s.name);
     }
@@ -406,7 +420,8 @@ export default {
       const c = cache(env);
 
       if (path === 'stations' || path === 'stations/') {
-        const stations = (await c.getStations()) ?? (await refreshStations(env));
+        const stations = applyNameOverrides(
+          (await c.getStations()) ?? (await refreshStations(env)));
         return json(stations, { cacheControl: CC_STATIONS });
       }
 
