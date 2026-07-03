@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import {
   LINES, STATIONS as FALLBACK_STATIONS,
   demoPredictions, demoIncidents,
@@ -83,6 +84,9 @@ function StationPicker({
   const wrapRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Guards the scroll-driven keyboard dismissal so the programmatic
+  // scroll-into-view fired on open doesn't blur the field that just autofocused.
+  const suppressBlurRef = useRef(false);
 
   useEffect(() => {
     if (!open) return;
@@ -98,21 +102,43 @@ function StationPicker({
     };
   }, [open]);
 
-  // On open: start with a clear query and focus the search box. On close: reset
-  // the query so the next open starts fresh.
+  // Reset the query when the picker closes so the next open starts fresh.
+  // Focus is NOT done here: iOS Safari only raises the on-screen keyboard when
+  // focus() runs synchronously inside the tap's own call stack, so it's handled
+  // in the trigger's onClick (a focus from an effect/rAF gets the caret but no
+  // keyboard on iOS — though it works on Android).
   useEffect(() => {
-    if (!open) { setQuery(''); return; }
-    const id = requestAnimationFrame(() => inputRef.current?.focus());
-    return () => cancelAnimationFrame(id);
+    if (!open) setQuery('');
   }, [open]);
 
   // Only scroll the active option into view on a fresh, unfiltered open —
-  // once the user is typing, the list reorders to the matches anyway.
+  // once the user is typing, the list reorders to the matches anyway. Suppress
+  // the scroll-driven blur for a frame so this programmatic scroll doesn't
+  // dismiss the keyboard that just auto-opened.
   useEffect(() => {
     if (!open || query || !menuRef.current) return;
     const active = menuRef.current.querySelector<HTMLElement>('.mx-selectopt.active');
-    active?.scrollIntoView({ block: 'nearest' });
+    if (!active) return;
+    suppressBlurRef.current = true;
+    active.scrollIntoView({ block: 'nearest' });
+    const id = requestAnimationFrame(() => { suppressBlurRef.current = false; });
+    return () => cancelAnimationFrame(id);
   }, [open, query]);
+
+  // Dismiss the keyboard once the user scrolls the list. touchmove alone (see
+  // the menu below) is unreliable on iOS for a position:fixed overflow
+  // container while the keyboard is up, so listen for scroll too — guarded so
+  // the open-time scroll-into-view above doesn't trip it.
+  useEffect(() => {
+    const menu = menuRef.current;
+    if (!open || !menu) return;
+    const onScroll = () => {
+      if (suppressBlurRef.current) return;
+      if (document.activeElement === inputRef.current) inputRef.current?.blur();
+    };
+    menu.addEventListener('scroll', onScroll, { passive: true });
+    return () => menu.removeEventListener('scroll', onScroll);
+  }, [open]);
 
   // Filter by station name, plus the short slug aliases (e.g. "dca" → Reagan,
   // "iad" → Dulles) so the well-known shortcuts find their station too.
@@ -127,7 +153,14 @@ function StationPicker({
   return (
     <div ref={wrapRef} className={'mx-selectwrap' + (open ? ' open' : '')}>
       <button type="button" className="mx-select"
-              onClick={() => setOpen((o) => !o)}
+              onClick={() => {
+                if (open) { setOpen(false); return; }
+                // flushSync mounts the menu (and its input) before this handler
+                // returns, so the focus() below still runs inside the tap's
+                // gesture — the only way iOS Safari will raise the keyboard.
+                flushSync(() => setOpen(true));
+                inputRef.current?.focus();
+              }}
               aria-haspopup="listbox" aria-expanded={open}>
         {value}
       </button>
@@ -137,9 +170,10 @@ function StationPicker({
       </svg>
       {open && (
         <div ref={menuRef} className="mx-selectmenu" role="listbox"
-             // Dismiss the keyboard once the user starts dragging to scroll.
-             // touchmove (not scroll) so the programmatic scroll-into-view on
-             // open doesn't blur the autofocused search field.
+             // Fast-path dismissal: blur the moment the finger starts dragging,
+             // before content moves. The guarded scroll listener above is the
+             // reliable fallback for iOS; this is safe unguarded because a
+             // programmatic scroll-into-view never fires touchmove.
              onTouchMove={() => {
                if (document.activeElement === inputRef.current) inputRef.current?.blur();
              }}>
