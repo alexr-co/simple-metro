@@ -84,9 +84,10 @@ function StationPicker({
   const wrapRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  // Guards the scroll-driven keyboard dismissal so the programmatic
-  // scroll-into-view fired on open doesn't blur the field that just autofocused.
-  const suppressBlurRef = useRef(false);
+  // True only while a finger is actually on the list, so the scroll-driven
+  // keyboard dismissal can ignore the reflow/clamp scrolls that fire while
+  // typing (and the programmatic scroll-into-view on open).
+  const touchingRef = useRef(false);
 
   useEffect(() => {
     if (!open) return;
@@ -112,28 +113,24 @@ function StationPicker({
   }, [open]);
 
   // Only scroll the active option into view on a fresh, unfiltered open —
-  // once the user is typing, the list reorders to the matches anyway. Suppress
-  // the scroll-driven blur for a frame so this programmatic scroll doesn't
-  // dismiss the keyboard that just auto-opened.
+  // once the user is typing, the list reorders to the matches anyway.
   useEffect(() => {
     if (!open || query || !menuRef.current) return;
     const active = menuRef.current.querySelector<HTMLElement>('.mx-selectopt.active');
-    if (!active) return;
-    suppressBlurRef.current = true;
-    active.scrollIntoView({ block: 'nearest' });
-    const id = requestAnimationFrame(() => { suppressBlurRef.current = false; });
-    return () => cancelAnimationFrame(id);
+    active?.scrollIntoView({ block: 'nearest' });
   }, [open, query]);
 
   // Dismiss the keyboard once the user scrolls the list. touchmove alone (see
   // the menu below) is unreliable on iOS for a position:fixed overflow
-  // container while the keyboard is up, so listen for scroll too — guarded so
-  // the open-time scroll-into-view above doesn't trip it.
+  // container while the keyboard is up, so listen for scroll too — but only
+  // while a finger is down. Typing shrinks the filtered list, which clamps the
+  // scroll position and fires 'scroll' with no touch; without this gate that
+  // would blur the field after a single character.
   useEffect(() => {
     const menu = menuRef.current;
     if (!open || !menu) return;
     const onScroll = () => {
-      if (suppressBlurRef.current) return;
+      if (!touchingRef.current) return;
       if (document.activeElement === inputRef.current) inputRef.current?.blur();
     };
     menu.addEventListener('scroll', onScroll, { passive: true });
@@ -170,10 +167,13 @@ function StationPicker({
       </svg>
       {open && (
         <div ref={menuRef} className="mx-selectmenu" role="listbox"
-             // Fast-path dismissal: blur the moment the finger starts dragging,
-             // before content moves. The guarded scroll listener above is the
-             // reliable fallback for iOS; this is safe unguarded because a
-             // programmatic scroll-into-view never fires touchmove.
+             // Track real touches so the scroll listener can tell a finger-drag
+             // apart from the reflow scroll that fires while typing.
+             onTouchStart={() => { touchingRef.current = true; }}
+             onTouchEnd={() => { touchingRef.current = false; }}
+             onTouchCancel={() => { touchingRef.current = false; }}
+             // Fast path: blur the instant the finger starts dragging, before
+             // the list moves. Typing never fires touchmove, so this is safe.
              onTouchMove={() => {
                if (document.activeElement === inputRef.current) inputRef.current?.blur();
              }}>
