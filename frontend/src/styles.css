@@ -270,19 +270,9 @@ body {
     background: var(--paper);
     overscroll-behavior: contain;
     /* Extra bottom room so the last rows can scroll clear of Safari's floating
-       bottom toolbar, leaving a solid-paper strip beneath the list. */
+       bottom toolbar, leaving a solid-paper strip the toolbar blends into (the
+       way it sits over the solid picker bar on the arrivals page). */
     padding-bottom: max(64px, calc(env(safe-area-inset-bottom) + 56px));
-  }
-  /* Solid → transparent paper fade pinned to the bottom of the overlay. Safari's
-     translucent bottom toolbar floats over this instead of sampling the scrolling
-     list, so it blends into paper the way it does over the solid picker bar on
-     the arrivals page. Fixed (not scrolled), non-interactive. */
-  .mx-selectmenu::after {
-    content: '';
-    position: fixed; left: 0; right: 0; bottom: 0;
-    height: calc(env(safe-area-inset-bottom) + 60px);
-    background: linear-gradient(to top, var(--paper) 55%, transparent);
-    pointer-events: none; z-index: 101;
   }
   .mx-searchwrap {
     display: flex; align-items: center; gap: 10px;
