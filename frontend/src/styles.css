@@ -269,10 +269,7 @@ body {
        blends instead of revealing a paper seam behind the card. */
     background: var(--paper);
     overscroll-behavior: contain;
-    /* Extra bottom room so the last rows can scroll clear of Safari's floating
-       bottom toolbar, leaving a solid-paper strip the toolbar blends into (the
-       way it sits over the solid picker bar on the arrivals page). */
-    padding-bottom: max(64px, calc(env(safe-area-inset-bottom) + 56px));
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
   }
   .mx-searchwrap {
     display: flex; align-items: center; gap: 10px;
@@ -304,7 +301,11 @@ body {
 @media (hover: hover) {
   .mx-selectopt:hover { background: var(--rule); }
 }
-.mx-selectopt.active { font-weight: 700; background: var(--rule); }
+/* Indicate the selected station with weight + a left accent rather than a filled
+   row background. A full-row background bleeds through Safari's translucent
+   bottom toolbar when the selected station sits behind it (e.g. right after
+   opening, when it's scrolled into view), tinting the toolbar off-paper. */
+.mx-selectopt.active { font-weight: 700; box-shadow: inset 3px 0 0 var(--rule-strong); }
 .mx-selectopt:last-child { border-bottom: none; }
 
 /* ── key sheet ── */
