@@ -93,6 +93,8 @@ interface RawStation {
 const NAME_OVERRIDES_BY_CODE: Record<string, string> = {
   E01: 'Mt Vernon Sq',                  // was: "Mt Vernon Sq-7th St"
   C10: 'Reagan National Airport',       // was: "Ronald Reagan Washington National Airport"
+  E03: 'U Street',                      // was: "U Street/African-Amer Civil War Memorial/Cardozo"
+  N10: 'Dulles International Airport',  // was: "Washington Dulles International Airport"
 };
 
 function adaptStations(raw: RawStation[]): Station[] {

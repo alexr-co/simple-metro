@@ -100,7 +100,7 @@ export const STATIONS: Station[] = [
   S('Reston Town Center',     ['N07'], ['SV']),
   S('Herndon',                ['N08'], ['SV']),
   S('Innovation Center',      ['N09'], ['SV']),
-  S('Washington Dulles Intl Airport', ['N10'], ['SV']),
+  S('Dulles International Airport', ['N10'], ['SV']),
   S('Loudoun Gateway',        ['N11'], ['SV']),
   S('Ashburn',                ['N12'], ['SV']),
   S('Smithsonian',            ['D02'], ['BL', 'OR', 'SV']),

@@ -15,8 +15,8 @@ export const SLUG_ALIASES: Record<string, string> = {
   reagan: 'Reagan National Airport',
   'reagan-airport': 'Reagan National Airport',
   dca: 'Reagan National Airport',
-  dulles: 'Washington Dulles Intl Airport',
-  iad: 'Washington Dulles Intl Airport',
+  dulles: 'Dulles International Airport',
+  iad: 'Dulles International Airport',
 };
 
 export function slugify(name: string): string {
