@@ -269,7 +269,20 @@ body {
        blends instead of revealing a paper seam behind the card. */
     background: var(--paper);
     overscroll-behavior: contain;
-    padding-bottom: max(12px, env(safe-area-inset-bottom));
+    /* Extra bottom room so the last rows can scroll clear of Safari's floating
+       bottom toolbar, leaving a solid-paper strip beneath the list. */
+    padding-bottom: max(64px, calc(env(safe-area-inset-bottom) + 56px));
+  }
+  /* Solid → transparent paper fade pinned to the bottom of the overlay. Safari's
+     translucent bottom toolbar floats over this instead of sampling the scrolling
+     list, so it blends into paper the way it does over the solid picker bar on
+     the arrivals page. Fixed (not scrolled), non-interactive. */
+  .mx-selectmenu::after {
+    content: '';
+    position: fixed; left: 0; right: 0; bottom: 0;
+    height: calc(env(safe-area-inset-bottom) + 60px);
+    background: linear-gradient(to top, var(--paper) 55%, transparent);
+    pointer-events: none; z-index: 101;
   }
   .mx-searchwrap {
     display: flex; align-items: center; gap: 10px;
@@ -292,8 +305,15 @@ body {
   border-bottom: 1px solid var(--rule);
   font-family: var(--sign); font-weight: 500; font-size: 15px;
   color: var(--ink); cursor: pointer;
+  /* No grey flash when tapping a row to scroll on touch devices. */
+  -webkit-tap-highlight-color: transparent;
 }
-.mx-selectopt:hover { background: var(--rule); }
+/* Hover only on real pointers. On touch, iOS keeps :hover stuck on the tapped
+   row until you tap elsewhere, so it would look highlighted (like a second
+   selection) next to the actually-selected .active row. */
+@media (hover: hover) {
+  .mx-selectopt:hover { background: var(--rule); }
+}
 .mx-selectopt.active { font-weight: 700; background: var(--rule); }
 .mx-selectopt:last-child { border-bottom: none; }
 
