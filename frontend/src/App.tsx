@@ -70,7 +70,7 @@ function ArrivalRow({ t, lead }: { t: Train; lead: boolean }) {
 }
 
 function Platform({ trains }: { trains: Train[] }) {
-  const sorted = [...trains].sort((a, b) => minRank(a.min) - minRank(b.min)).slice(0, 4);
+  const sorted = [...trains].sort((a, b) => minRank(a.min) - minRank(b.min)).slice(0, 6);
   return (
     <div className="mx-plat-block">
       {sorted.length === 0

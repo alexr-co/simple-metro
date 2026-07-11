@@ -1,10 +1,13 @@
 /* WMATA proxy on Cloudflare Workers.
  *
  * scheduled() — pre-warms the WmataCache Durable Object from WMATA on three
- *   cron schedules: predictions/All (every 20s via in-handler fan-out),
- *   incidents (every 5 min), stations (daily). One WMATA call serves every
- *   station, so upstream load is constant and tiny (~4,600/day) regardless
- *   of user count.
+ *   cron schedules: predictions (every 20s via in-handler fan-out), incidents
+ *   (every 5 min), stations (daily). Predictions come from WMATA's GTFS-Realtime
+ *   TripUpdates feed — the same engine wmata.com uses — which gives real
+ *   predicted arrival times for every upcoming train at every platform (not just
+ *   the nearest ~3 like the legacy GetPrediction endpoint). GetPrediction is kept
+ *   only as a fallback if the GTFS-RT feed is unavailable. One WMATA call of each
+ *   kind serves every station, so upstream load is constant regardless of users.
  *
  * fetch() — serves /api/wmata/{stations,incidents,predictions/:codes} by
  *   reading from the DO (strongly consistent globally — no per-POP 60s
@@ -131,7 +134,7 @@ interface RawTrain {
   Car?: string; Min?: string; Group?: string; LocationCode?: string;
 }
 // dest here is the raw WMATA value — possibly abbreviated ("New Crlton"). The
-// canonical full name gets swapped in inside refreshPredictions() once the
+// canonical full name gets swapped in inside enrichPredictions() once the
 // stations map is available.
 function adaptPredictions(raw: RawTrain[]): Train[] {
   return raw
@@ -156,30 +159,267 @@ function adaptIncidents(raw: RawIncident[]): Incident[] {
   }));
 }
 
-// ── fetch + store routines (called by both scheduled and cold-DO fallback) ──
-async function fetchAllPredictions(env: Env): Promise<Train[]> {
-  const data = await wmataGet<{ Trains?: RawTrain[] }>(
-    'StationPrediction.svc/json/GetPrediction/All', env.WMATA_KEY);
-  return adaptPredictions(data.Trains ?? []);
+// ── GTFS-Realtime TripUpdates: the primary prediction source ─────────────────
+// WMATA publishes a protobuf feed of real-time trip predictions — for every
+// active train, the predicted arrival time at each of its remaining stops. This
+// is the same data wmata.com surfaces, and unlike the legacy GetPrediction
+// endpoint (nearest ~3 trains per platform) it reaches ~45 min out. We decode it
+// with a tiny hand-rolled protobuf reader (below) so the Worker stays
+// dependency-free — we only need a handful of fields from the schema.
+//
+// GTFS-RT proto shape (fields we read):
+//   FeedMessage { repeated FeedEntity entity = 2 }
+//   FeedEntity  { TripUpdate trip_update = 3 }
+//   TripUpdate  { TripDescriptor trip = 1; repeated StopTimeUpdate stop_time_update = 2 }
+//   TripDescriptor  { string trip_id = 1; string route_id = 5; uint32 direction_id = 6 }
+//   StopTimeUpdate  { StopTimeEvent arrival = 2; StopTimeEvent departure = 3; string stop_id = 4 }
+//   StopTimeEvent   { int64 time = 2 }
+//
+// Car count comes from a companion feed, VehiclePositions, joined by trip_id:
+//   FeedEntity      { VehiclePosition vehicle = 4 }
+//   VehiclePosition { TripDescriptor trip = 1; VehicleDescriptor vehicle = 8 }
+//   VehicleDescriptor { string license_plate = 3 }   // "8_7610-7611…" → 8 cars
+// WMATA leaves the standard multi_carriage_details empty but encodes the consist
+// size as the license_plate prefix (verified to always equal the actual car
+// roster length). Only dispatched trains appear here, so far-future trips have
+// no count yet — same reason WMATA can't show one either.
+
+interface Cursor { buf: Uint8Array; pos: number }
+
+// Base-128 varint. Uses float multiplication (not <<) for the high bytes so
+// 64-bit values like Unix timestamps decode correctly past 2^32.
+function readVarint(c: Cursor): number {
+  let result = 0, shift = 0, byte: number;
+  do {
+    byte = c.buf[c.pos++] ?? 0;
+    result += (byte & 0x7f) * Math.pow(2, shift);
+    shift += 7;
+  } while (byte & 0x80);
+  return result;
 }
-async function fetchIncidents(env: Env): Promise<Incident[]> {
-  const data = await wmataGet<{ Incidents?: RawIncident[] }>(
-    'Incidents.svc/json/Incidents', env.WMATA_KEY);
-  return adaptIncidents(data.Incidents ?? []);
+function readTag(c: Cursor): { field: number; wire: number } {
+  const key = readVarint(c);
+  return { field: Math.floor(key / 8), wire: key & 7 };
 }
-async function fetchStations(env: Env): Promise<Station[]> {
-  const data = await wmataGet<{ Stations?: RawStation[] }>(
-    'Rail.svc/json/jStations', env.WMATA_KEY);
-  return adaptStations(data.Stations ?? []);
+function readString(c: Cursor): string {
+  const len = readVarint(c);
+  const s = new TextDecoder().decode(c.buf.subarray(c.pos, c.pos + len));
+  c.pos += len;
+  return s;
+}
+// A sub-cursor over the next length-delimited field (a nested message).
+function readMessage(c: Cursor): Cursor {
+  const len = readVarint(c);
+  const sub = { buf: c.buf.subarray(c.pos, c.pos + len), pos: 0 };
+  c.pos += len;
+  return sub;
+}
+function skipField(c: Cursor, wire: number): void {
+  switch (wire) {
+    case 0: readVarint(c); break;                              // varint
+    case 1: c.pos += 8; break;                                 // 64-bit
+    case 2: { const len = readVarint(c); c.pos += len; break; } // length-delimited
+    case 5: c.pos += 4; break;                                 // 32-bit
+    default: c.pos = c.buf.length;                             // unknown → bail out
+  }
 }
 
-// Fallback when WMATA returns a train with a blank DestinationCode (typical
-// for short-turn / terminating trains). Keys are abbreviated dest strings
-// WMATA puts on platform signs; values are the canonical full names that
-// match the station picker. Lookup below is case-insensitive so ALL-CAPS
-// variants like "REAGAN AIRPORT" match the title-cased entry. Extend this
-// map when "unmapped destination" warnings show up in Worker logs for a
-// previously-unseen short name.
+interface GtfsStop { code?: string; time?: number }
+interface GtfsTrip { tripId?: string; routeId?: string; directionId?: number; stops: GtfsStop[] }
+
+function parseStopTimeEvent(c: Cursor): number | undefined {
+  let time: number | undefined;
+  while (c.pos < c.buf.length) {
+    const { field, wire } = readTag(c);
+    if (field === 2 && wire === 0) time = readVarint(c);       // int64 time
+    else skipField(c, wire);
+  }
+  return time;
+}
+function parseStopTimeUpdate(c: Cursor): GtfsStop {
+  const stop: GtfsStop = {};
+  let arrival: number | undefined, departure: number | undefined;
+  while (c.pos < c.buf.length) {
+    const { field, wire } = readTag(c);
+    if (field === 4 && wire === 2) stop.code = stationCode(readString(c));
+    else if (field === 2 && wire === 2) arrival = parseStopTimeEvent(readMessage(c));
+    else if (field === 3 && wire === 2) departure = parseStopTimeEvent(readMessage(c));
+    else skipField(c, wire);
+  }
+  stop.time = arrival ?? departure;   // first stop has departure only; terminus arrival only
+  return stop;
+}
+function parseTripDescriptor(c: Cursor, trip: GtfsTrip): void {
+  while (c.pos < c.buf.length) {
+    const { field, wire } = readTag(c);
+    if (field === 1 && wire === 2) trip.tripId = readString(c);
+    else if (field === 5 && wire === 2) trip.routeId = readString(c);
+    else if (field === 6 && wire === 0) trip.directionId = readVarint(c);
+    else skipField(c, wire);
+  }
+}
+function parseTripUpdate(c: Cursor): GtfsTrip {
+  const trip: GtfsTrip = { stops: [] };
+  while (c.pos < c.buf.length) {
+    const { field, wire } = readTag(c);
+    if (field === 1 && wire === 2) parseTripDescriptor(readMessage(c), trip);
+    else if (field === 2 && wire === 2) trip.stops.push(parseStopTimeUpdate(readMessage(c)));
+    else skipField(c, wire);
+  }
+  return trip;
+}
+function parseTripUpdateFeed(buf: Uint8Array): GtfsTrip[] {
+  const c: Cursor = { buf, pos: 0 };
+  const trips: GtfsTrip[] = [];
+  while (c.pos < c.buf.length) {
+    const { field, wire } = readTag(c);
+    if (field === 2 && wire === 2) {              // FeedEntity
+      const ent = readMessage(c);
+      while (ent.pos < ent.buf.length) {
+        const t = readTag(ent);
+        if (t.field === 3 && t.wire === 2) trips.push(parseTripUpdate(readMessage(ent)));
+        else skipField(ent, t.wire);
+      }
+    } else skipField(c, wire);
+  }
+  return trips;
+}
+
+// VehiclePositions → a trip_id → car-count map. Reads just the two fields we
+// need: the trip descriptor's trip_id (the join key) and the vehicle
+// descriptor's license_plate (whose "<n>_…" prefix is the car count).
+function tripIdOf(c: Cursor): string | undefined {
+  let id: string | undefined;
+  while (c.pos < c.buf.length) {
+    const { field, wire } = readTag(c);
+    if (field === 1 && wire === 2) id = readString(c);
+    else skipField(c, wire);
+  }
+  return id;
+}
+function carCountOf(c: Cursor): number | undefined {   // VehicleDescriptor
+  let lp: string | undefined;
+  while (c.pos < c.buf.length) {
+    const { field, wire } = readTag(c);
+    if (field === 3 && wire === 2) lp = readString(c);
+    else skipField(c, wire);
+  }
+  const m = lp ? /^(\d+)_/.exec(lp) : null;
+  return m ? Number(m[1]) : undefined;
+}
+function parseVehiclePosition(c: Cursor): { tripId?: string; cars?: number } {
+  let tripId: string | undefined, cars: number | undefined;
+  while (c.pos < c.buf.length) {
+    const { field, wire } = readTag(c);
+    if (field === 1 && wire === 2) tripId = tripIdOf(readMessage(c));       // trip descriptor
+    else if (field === 8 && wire === 2) cars = carCountOf(readMessage(c));  // vehicle descriptor
+    else skipField(c, wire);
+  }
+  return { tripId, cars };
+}
+function parseVehiclePositionFeed(buf: Uint8Array): Map<string, number> {
+  const c: Cursor = { buf, pos: 0 };
+  const out = new Map<string, number>();
+  while (c.pos < c.buf.length) {
+    const { field, wire } = readTag(c);
+    if (field === 2 && wire === 2) {              // FeedEntity
+      const ent = readMessage(c);
+      while (ent.pos < ent.buf.length) {
+        const t = readTag(ent);
+        if (t.field === 4 && t.wire === 2) {       // FeedEntity.vehicle
+          const { tripId, cars } = parseVehiclePosition(readMessage(ent));
+          if (tripId && cars && cars > 0) out.set(tripId, cars);
+        } else skipField(ent, t.wire);
+      }
+    } else skipField(c, wire);
+  }
+  return out;
+}
+
+// GTFS stop_ids embed the station code: "PF_A08_C" → "A08". No static GTFS
+// lookup needed — the middle token is exactly WMATA's platform code.
+function stationCode(stopId: string): string | undefined {
+  return /^[A-Z]+_([A-Z]\d{2})_/.exec(stopId)?.[1];
+}
+
+const ROUTE_TO_LINE: Record<string, LineCode> = {
+  RED: 'RD', ORANGE: 'OR', SILVER: 'SV', BLUE: 'BL', YELLOW: 'YL', GREEN: 'GR',
+};
+
+// How far out to surface predictions, and the per-platform-direction row cap.
+// The cap bounds the stored snapshot: the whole system lives in one Durable
+// Object value (128 KiB limit), and 186 platform-directions × this cap × ~100
+// bytes/row must stay well under it. 5 keeps us ~85 KiB and still reaches the
+// next train of each line at busy shared platforms (e.g. the 2nd Franconia at
+// Pentagon City). The frontend slices to 6, so it renders whatever it's given.
+const FEED_HORIZON_MIN = 45;
+const MAX_PLATFORM_ROWS = 5;
+
+// Sort key mirroring the frontend's minRank so the per-platform cap keeps the
+// soonest trains.
+const minRank = (m: string): number => {
+  if (m === 'ARR') return -1;
+  const n = parseInt(m, 10);
+  return Number.isNaN(n) ? 999 : n;
+};
+
+// Convert decoded trips into the flat per-platform Train list the frontend
+// expects. Each stop on a trip becomes a board row at that station, in the
+// trip's travel direction (direction_id → group). The trip's final stop is its
+// destination; we skip that stop itself (a train terminating at your platform
+// isn't a boardable departure — its turnaround shows up as a separate trip).
+function tripsToTrains(
+  trips: GtfsTrip[], nowSec: number, codeToName: Map<string, string>, carsByTrip: Map<string, number>,
+): Train[] {
+  const rows: Train[] = [];
+  for (const trip of trips) {
+    const line = trip.routeId ? ROUTE_TO_LINE[trip.routeId] ?? null : null;
+    const stops = trip.stops.filter((s) => s.code);
+    if (stops.length === 0) continue;
+    const destCode = stops[stops.length - 1].code ?? null;
+    const dest = (destCode && codeToName.get(destCode)) || '—';
+    const group = trip.directionId === 1 ? '2' : '1';
+    // Car count joined by trip_id from VehiclePositions; absent for trains not
+    // yet dispatched (typically the further-out trips).
+    const carCount = trip.tripId ? carsByTrip.get(trip.tripId) : undefined;
+    const cars = carCount && carCount > 0 ? String(carCount) : null;
+    for (const s of stops) {
+      if (!s.code || s.code === destCode || s.time == null) continue;
+      const minutes = (s.time - nowSec) / 60;
+      if (minutes < -0.5 || minutes > FEED_HORIZON_MIN) continue;
+      rows.push({
+        line, dest, destCode, cars,
+        min: minutes < 0.5 ? 'ARR' : String(Math.round(minutes)),
+        group, loc: s.code,
+      });
+    }
+  }
+  return capPerPlatform(rows);
+}
+
+// Keep only the soonest MAX_PLATFORM_ROWS per platform+direction so the stored
+// snapshot stays small (the whole system in one DO value).
+function capPerPlatform(rows: Train[]): Train[] {
+  const byPlatform = new Map<string, Train[]>();
+  for (const t of rows) {
+    const k = `${t.loc}|${t.group}`;
+    let arr = byPlatform.get(k);
+    if (!arr) { arr = []; byPlatform.set(k, arr); }
+    arr.push(t);
+  }
+  const out: Train[] = [];
+  for (const arr of byPlatform.values()) {
+    arr.sort((a, b) => minRank(a.min) - minRank(b.min));
+    out.push(...arr.slice(0, MAX_PLATFORM_ROWS));
+  }
+  return out;
+}
+
+// Fallback dest resolution for the GetPrediction path (used only when GTFS-RT is
+// unavailable). Keys are abbreviated dest strings WMATA puts on platform signs;
+// values are the canonical full names that match the station picker. Lookup is
+// case-insensitive so ALL-CAPS variants like "REAGAN AIRPORT" match. Extend this
+// map when "unmapped destination" warnings show up in Worker logs.
 const ABBREV_TO_NAME: Record<string, string> = {
   'New Crlton': 'New Carrollton',
   'NewCrlton': 'New Carrollton',
@@ -274,28 +514,47 @@ function fuzzyMatch(dest: string, index: StationFuzzy[]): string | undefined {
   return (best >= 4 && best - second >= 2) ? bestName : undefined;
 }
 
-async function refreshPredictions(env: Env): Promise<Train[]> {
-  const c = cache(env);
-  const trains = await fetchAllPredictions(env);
+// ── fetch + store routines (called by both scheduled and cold-DO fallback) ──
+async function fetchTripUpdates(env: Env): Promise<GtfsTrip[]> {
+  const r = await fetch(`${WMATA_BASE}/gtfs/rail-gtfsrt-tripupdates.pb`, {
+    headers: { api_key: env.WMATA_KEY },
+  });
+  if (!r.ok) throw new Error(`WMATA ${r.status} ${r.statusText} for gtfs tripupdates`);
+  return parseTripUpdateFeed(new Uint8Array(await r.arrayBuffer()));
+}
+async function fetchVehicleCars(env: Env): Promise<Map<string, number>> {
+  const r = await fetch(`${WMATA_BASE}/gtfs/rail-gtfsrt-vehiclepositions.pb`, {
+    headers: { api_key: env.WMATA_KEY },
+  });
+  if (!r.ok) throw new Error(`WMATA ${r.status} ${r.statusText} for gtfs vehiclepositions`);
+  return parseVehiclePositionFeed(new Uint8Array(await r.arrayBuffer()));
+}
+async function fetchAllPredictions(env: Env): Promise<Train[]> {
+  const data = await wmataGet<{ Trains?: RawTrain[] }>(
+    'StationPrediction.svc/json/GetPrediction/All', env.WMATA_KEY);
+  return adaptPredictions(data.Trains ?? []);
+}
+async function fetchIncidents(env: Env): Promise<Incident[]> {
+  const data = await wmataGet<{ Incidents?: RawIncident[] }>(
+    'Incidents.svc/json/Incidents', env.WMATA_KEY);
+  return adaptIncidents(data.Incidents ?? []);
+}
+async function fetchStations(env: Env): Promise<Station[]> {
+  const data = await wmataGet<{ Stations?: RawStation[] }>(
+    'Rail.svc/json/jStations', env.WMATA_KEY);
+  return adaptStations(data.Stations ?? []);
+}
 
-  // Build a destCode → canonical-name map + fuzzy index from the cached
-  // stations list. If stations is cold, refresh it once on the way through.
-  const codeToName = new Map<string, string>();
-  let fuzzyIndex: StationFuzzy[] = [];
-  try {
-    const cached = await c.getStations();
-    const stations = applyNameOverrides(
-      (cached && cached.length > 0) ? cached : await refreshStations(env));
-    for (const s of stations) {
-      for (const code of s.codes) codeToName.set(code, s.name);
-    }
-    fuzzyIndex = buildFuzzyIndex(stations);
-  } catch (e) {
-    console.warn('stations unavailable for prediction enrichment; keeping raw dest', e);
-  }
-
-  // Memoize fuzzy lookups within this refresh — the same short name typically
-  // appears across many trains in one batch.
+// Resolve GetPrediction's raw/abbreviated destinations to canonical station
+// names. Only used on the fallback path — the GTFS-RT path resolves dest
+// straight from the destination station code.
+//   1. destCode lookup against the canonical station list (most precise)
+//   2. hardcoded short→long map (deterministic, fast)
+//   3. fuzzy token+vowel-drop match against canonical station names
+//   4. raw WMATA `dest` (last resort — logged so we can extend the map)
+function enrichPredictions(
+  trains: Train[], codeToName: Map<string, string>, fuzzyIndex: StationFuzzy[],
+): Train[] {
   const fuzzyMemo = new Map<string, string | undefined>();
   const fuzzy = (dest: string): string | undefined => {
     if (fuzzyIndex.length === 0) return undefined;
@@ -304,14 +563,7 @@ async function refreshPredictions(env: Env): Promise<Train[]> {
     fuzzyMemo.set(dest, result);
     return result;
   };
-
-  // Resolution priority:
-  //   1. destCode lookup against the canonical station list (most precise)
-  //   2. hardcoded short→long map (deterministic, fast)
-  //   3. fuzzy token+vowel-drop match against canonical station names (catches
-  //      WMATA abbreviation variants we haven't explicitly mapped)
-  //   4. raw WMATA `dest` (last resort — logged so we can extend the map)
-  const enriched: Train[] = trains.map((t) => {
+  return trains.map((t) => {
     const fromCode = t.destCode ? codeToName.get(t.destCode) : undefined;
     const fromAbbrev = ABBREV_LOOKUP[t.dest.toLowerCase()];
     const fromFuzzy = (!fromCode && !fromAbbrev) ? fuzzy(t.dest) : undefined;
@@ -320,8 +572,49 @@ async function refreshPredictions(env: Env): Promise<Train[]> {
     }
     return { ...t, dest: fromCode || fromAbbrev || fromFuzzy || t.dest };
   });
-  await c.putPredictions(enriched);
-  return enriched;
+}
+
+async function refreshPredictions(env: Env): Promise<Train[]> {
+  const c = cache(env);
+
+  // codeToName maps a destination station code → canonical name (for the
+  // GTFS-RT dest column). fuzzyIndex is only needed for the GetPrediction
+  // fallback. If stations is cold, refresh it once on the way through.
+  const codeToName = new Map<string, string>();
+  let fuzzyIndex: StationFuzzy[] = [];
+  try {
+    const cached = await c.getStations();
+    const stations = applyNameOverrides(
+      (cached && cached.length > 0) ? cached : await refreshStations(env));
+    for (const s of stations) for (const code of s.codes) codeToName.set(code, s.name);
+    fuzzyIndex = buildFuzzyIndex(stations);
+  } catch (e) {
+    console.warn('stations unavailable for prediction enrichment; keeping raw dest', e);
+  }
+
+  // Primary: GTFS-RT TripUpdates (real predictions, full horizon, all trains).
+  // Fallback: legacy GetPrediction (nearest ~3 per platform) so the board never
+  // goes blank if the protobuf feed hiccups.
+  let trains: Train[];
+  try {
+    // Car counts (VehiclePositions) are a best-effort side channel: if that feed
+    // fails we still serve predictions, just without the "N car" line.
+    const [trips, carsByTrip] = await Promise.all([
+      fetchTripUpdates(env),
+      fetchVehicleCars(env).catch((e) => {
+        console.warn('vehiclepositions failed; serving without car counts', e);
+        return new Map<string, number>();
+      }),
+    ]);
+    if (trips.length === 0) throw new Error('empty tripupdates feed');
+    trains = tripsToTrains(trips, Date.now() / 1000, codeToName, carsByTrip);
+  } catch (e) {
+    console.warn('gtfs-rt tripupdates failed; falling back to GetPrediction', e);
+    trains = enrichPredictions(await fetchAllPredictions(env), codeToName, fuzzyIndex);
+  }
+
+  await c.putPredictions(trains);
+  return trains;
 }
 async function refreshIncidents(env: Env): Promise<Incident[]> {
   const incidents = await fetchIncidents(env);
