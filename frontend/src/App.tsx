@@ -143,13 +143,14 @@ function mapsHref(station: Station): { href: string; newTab: boolean } {
     };
   }
   if (isIOS) {
-    // Apple Maps treats `q` as a search term (it would search the station name),
-    // so use `address` to open the actual street address; fall back to a bare
-    // coordinate pin, then a name search only as a last resort.
+    // Apple Maps geocodes both a bare name (`q`) and a street address
+    // unreliably for transit stops — a name can match the wrong city, an
+    // address can land off. Pin the exact WMATA coordinate instead; fall back to
+    // the address, then a name search, only when coordinates are unavailable.
     return {
-      href: station.address
-        ? `https://maps.apple.com/?address=${encodeURIComponent(addr)}`
-        : ll ? `https://maps.apple.com/?ll=${ll}`
+      href: ll
+        ? `https://maps.apple.com/?ll=${ll}`
+        : station.address ? `https://maps.apple.com/?address=${encodeURIComponent(addr)}`
         : `https://maps.apple.com/?q=${encodeURIComponent(station.name)}`,
       newTab: false,
     };
