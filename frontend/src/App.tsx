@@ -121,6 +121,39 @@ function fmtReturn(iso: string | null): string | null {
     : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' });
 }
 
+// Maps link that respects the user's map app where the OS allows it. On Android
+// the geo: URI hands off to whatever map app the user has set as default (or the
+// app chooser). iOS has no user-settable default map app, so links there open
+// Apple Maps. Desktop opens Google Maps on the web (new tab). newTab is false for
+// the mobile schemes so the app takes over without leaving a stray blank tab.
+function mapsHref(station: Station): { href: string; newTab: boolean } {
+  const ll = station.lat != null && station.lon != null ? `${station.lat},${station.lon}` : null;
+  const addr = station.address
+    ? `${station.address.street}, ${station.address.city}, ${station.address.state} ${station.address.zip}`
+    : station.name;
+  const label = encodeURIComponent(station.name);
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  const isIOS = /iP(hone|ad|od)/.test(ua)
+    || (typeof navigator !== 'undefined' && navigator.platform === 'MacIntel' && (navigator.maxTouchPoints ?? 0) > 1);
+
+  if (/Android/.test(ua)) {
+    return {
+      href: ll ? `geo:${ll}?q=${ll}(${label})` : `geo:0,0?q=${encodeURIComponent(addr)}`,
+      newTab: false,
+    };
+  }
+  if (isIOS) {
+    return {
+      href: ll ? `https://maps.apple.com/?ll=${ll}&q=${label}` : `https://maps.apple.com/?q=${encodeURIComponent(addr)}`,
+      newTab: false,
+    };
+  }
+  return {
+    href: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(ll ?? addr)}`,
+    newTab: true,
+  };
+}
+
 // ── presentational bits ───────────────────────────────────────
 function LineTile({ code, size = 22 }: { code: LineCode | null; size?: number }) {
   const ln = lineOf(code);
@@ -208,12 +241,7 @@ function InfoTab({ station, times, elevator, incidents, loading, error }: {
   const status = operatingStatus(station.codes, times);
   const first = dayTrains(station.codes, times, today, 'first');
   const last = dayTrains(station.codes, times, today, 'last');
-  // Prefer the human address for the Maps query (opens the named place, not a
-  // bare pin); fall back to coordinates, then the station name.
-  const mapsQuery = station.address
-    ? `${station.address.street}, ${station.address.city}, ${station.address.state} ${station.address.zip}`
-    : station.lat != null ? `${station.lat},${station.lon}` : station.name;
-  const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(mapsQuery)}`;
+  const maps = mapsHref(station);
 
   return (
     <div className="mx-info">
@@ -231,7 +259,8 @@ function InfoTab({ station, times, elevator, incidents, loading, error }: {
           <div className="mx-address">
             {station.address.city}, {station.address.state} {station.address.zip}
           </div>
-          <a className="mx-maplink" href={mapsUrl} target="_blank" rel="noreferrer">
+          <a className="mx-maplink" href={maps.href}
+             {...(maps.newTab ? { target: '_blank', rel: 'noreferrer' } : {})}>
             Open in Maps →
           </a>
         </div>
