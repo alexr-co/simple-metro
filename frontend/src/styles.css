@@ -128,10 +128,28 @@ body {
 @keyframes mxspin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
 
 /* ── board ── */
-/* min-height:0 lets this flex child shrink below its content height so it
-   scrolls internally instead of pushing the picker off the bottom. */
+/* Wrapper holds the scrolling board plus the scroll cue overlaid at its bottom.
+   min-height:0 lets it shrink below content height so the board scrolls
+   internally instead of pushing the picker off the bottom. */
+.mx-boardwrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .mx-board { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .mx-plat-block { border-top: 1.5px solid var(--rule-strong); }
+
+/* Scroll cue — a fade to paper with a bobbing chevron, hinting the board
+   scrolls. Fades in only while content lies below the fold; pointer-events:none
+   so it never intercepts a tap or scroll. */
+.mx-scrollcue {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 54px;
+  display: flex; align-items: flex-end; justify-content: center;
+  padding-bottom: 6px;
+  background: linear-gradient(to top, var(--paper) 24%, transparent);
+  pointer-events: none;
+  opacity: 0; transition: opacity 0.25s ease;
+}
+.mx-scrollcue.show { opacity: 1; }
+.mx-scrollcue-chev { color: var(--muted); animation: mxbob 1.7s ease-in-out infinite; }
+@keyframes mxbob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(3px); } }
+@media (prefers-reduced-motion: reduce) { .mx-scrollcue-chev { animation: none; } }
 
 .mx-row {
   position: relative; display: flex; align-items: center; gap: 12px;
@@ -216,12 +234,23 @@ body {
 /* ── picker ── */
 .mx-picker {
   border-top: 1.5px solid var(--rule-strong); background: var(--paper);
+  /* Flat bottom padding in the browser: iOS Safari's bottom toolbar already
+     clears the home indicator, so applying env(safe-area-inset-bottom) here
+     would double up and leave an oversized gap (Android reports ~0 and looks
+     right at 22px). The inset is restored below for standalone/installed mode,
+     where there's no toolbar and the picker would otherwise sit on the home
+     indicator. */
   padding:
     13px
     max(20px, env(safe-area-inset-right))
-    max(22px, env(safe-area-inset-bottom))
+    22px
     max(20px, env(safe-area-inset-left));
   display: flex; flex-direction: column; gap: 6px;
+}
+/* Home Screen / standalone: no browser toolbar, so honor the home-indicator
+   inset again. */
+@media (display-mode: standalone) {
+  .mx-picker { padding-bottom: max(22px, env(safe-area-inset-bottom)); }
 }
 .mx-pickerlabel { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.16em; color: var(--muted); }
 .mx-selectwrap { position: relative; }
