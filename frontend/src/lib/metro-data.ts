@@ -8,10 +8,33 @@ export interface Line {
   ink: string;
 }
 
+export interface StationAddress { street: string; city: string; state: string; zip: string }
+
 export interface Station {
   name: string;
   codes: string[];      // every platform code at this station (transfer stations carry two)
   lines: LineCode[];
+  lat?: number;
+  lon?: number;
+  address?: StationAddress;
+}
+
+// ── Info-tab data ─────────────────────────────────────────────
+export type Weekday =
+  'Monday' | 'Tuesday' | 'Wednesday' | 'Thursday' | 'Friday' | 'Saturday' | 'Sunday';
+
+export interface SchedTrain { time: string; dest: string }   // time = "HH:MM" (24h), dest = station name
+export interface DaySched { open: string; first: SchedTrain[]; last: SchedTrain[] }
+export type WeekSched = Partial<Record<Weekday, DaySched>>;
+// Keyed by platform code (a transfer station has one entry per platform).
+export type StationTimes = Record<string, WeekSched>;
+
+export interface ElevatorOutage {
+  station: string;      // platform code
+  unit: 'ELEVATOR' | 'ESCALATOR';
+  location: string;
+  reason: string;
+  returns: string | null;   // ISO estimated return, if any
 }
 
 export interface Train {

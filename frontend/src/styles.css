@@ -73,11 +73,11 @@ body {
   padding:
     max(18px, env(safe-area-inset-top))
     max(24px, env(safe-area-inset-right))
-    14px
+    10px
     max(24px, env(safe-area-inset-left));
 }
 @media (min-width: 640px) {
-  .mx-station { padding: 22px 26px 14px; }
+  .mx-station { padding: 22px 26px 10px; }
 }
 .mx-stationhead { display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
 .mx-stationName {
@@ -358,3 +358,114 @@ body {
 @keyframes mxblink { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
 @keyframes mxfade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes mxslideup { from { transform: translateY(100%); } to { transform: translateY(0); } }
+
+/* ── tabs (Arrivals / Info) ── */
+.mx-tabs {
+  display: flex; flex-shrink: 0;
+  border-bottom: 1.5px solid var(--rule-strong);
+}
+.mx-tab {
+  flex: 1; text-align: center;
+  background: transparent; border: none; cursor: pointer;
+  font-family: var(--mono); font-weight: 700; font-size: 12px;
+  text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+  padding: 11px 2px; margin-bottom: -1.5px;
+  border-bottom: 3px solid transparent; border-radius: 7px 7px 0 0;
+  transition: background 0.15s, color 0.15s;
+}
+.mx-tab.active {
+  color: var(--ink); font-weight: 800;
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  border-bottom-color: var(--rule-strong);
+}
+@media (hover: hover) {
+  .mx-tab:not(.active):hover {
+    color: var(--ink);
+    background: color-mix(in srgb, var(--ink) 3%, transparent);
+  }
+}
+.mx-tabbadge {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--warn); margin-left: 6px; vertical-align: 1px;
+}
+/* The tab bar's bottom rule is the divider; drop the board's first top rule so
+   they don't stack into a double line. */
+.mx-board > .mx-plat-block:first-child { border-top: none; }
+
+/* ── info tab ── */
+.mx-info {
+  padding: 18px max(24px, env(safe-area-inset-left)) 26px;
+  display: flex; flex-direction: column; gap: 20px;
+}
+@media (min-width: 640px) { .mx-info { padding: 18px 26px 26px; } }
+.mx-infocard-title {
+  font-family: var(--mono); font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+  margin-bottom: 10px;
+}
+
+/* operating status pill */
+.mx-opstatus {
+  display: flex; align-items: center; gap: 9px;
+  font-size: 15px; font-weight: 700; letter-spacing: -0.2px;
+  padding: 13px 15px; border-radius: 12px; border: 1px solid var(--rule);
+}
+.mx-opstatus.closed { color: var(--muted); }
+.mx-opdot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.mx-opstatus.open .mx-opdot { background: var(--good); }
+.mx-opstatus.closed .mx-opdot { background: var(--bad); }
+
+/* first/last schedule lists */
+.mx-sched { margin-bottom: 14px; }
+.mx-sched:last-child { margin-bottom: 0; }
+.mx-sched-label {
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted);
+  margin-bottom: 4px;
+}
+.mx-sched-row {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+  padding: 7px 0; border-bottom: 1px solid var(--rule);
+}
+.mx-sched-row:last-child { border-bottom: none; }
+.mx-sched-dest {
+  font-weight: 600; font-size: 14px; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mx-sched-time {
+  font-family: var(--mono); font-size: 13px; color: var(--muted);
+  font-variant-numeric: tabular-nums; flex-shrink: 0;
+}
+
+/* address + maps */
+.mx-address { font-size: 14px; line-height: 1.5; }
+.mx-maplink {
+  display: inline-block; margin-top: 9px;
+  font-family: var(--mono); font-size: 12px; font-weight: 700;
+  color: var(--ink); text-decoration: none;
+  border-bottom: 1.5px solid var(--rule-strong); padding-bottom: 1px;
+}
+.mx-maplink:hover { color: var(--muted); border-color: var(--rule); }
+
+/* elevators & escalators */
+.mx-eles-ok { font-size: 14px; color: var(--good); font-weight: 600; }
+.mx-eles-row {
+  display: flex; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--rule);
+}
+.mx-eles-row:last-child { border-bottom: none; }
+.mx-eles-unit {
+  font-family: var(--mono); font-size: 9.5px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+  border: 1px solid var(--rule); border-radius: 4px; padding: 3px 6px;
+  height: fit-content; flex-shrink: 0; white-space: nowrap;
+}
+.mx-eles-detail { font-size: 13.5px; line-height: 1.4; min-width: 0; }
+.mx-eles-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+/* service alerts mirror */
+.mx-info-alert {
+  font-size: 13px; line-height: 1.45; color: var(--ink); opacity: 0.82;
+  padding: 8px 0; border-bottom: 1px solid var(--rule);
+}
+.mx-info-alert:last-child { border-bottom: none; }
+.mx-info-empty { font-size: 13px; color: var(--muted); }

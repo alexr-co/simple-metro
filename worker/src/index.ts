@@ -30,7 +30,11 @@ const VALID_LINES: readonly LineCode[] = ['RD', 'OR', 'SV', 'BL', 'YL', 'GR'];
 const isValidLine = (s: unknown): s is LineCode =>
   typeof s === 'string' && (VALID_LINES as readonly string[]).includes(s);
 
-interface Station { name: string; codes: string[]; lines: LineCode[] }
+interface StationAddress { street: string; city: string; state: string; zip: string }
+interface Station {
+  name: string; codes: string[]; lines: LineCode[];
+  lat?: number; lon?: number; address?: StationAddress;
+}
 interface Train {
   line: LineCode | null;
   dest: string;          // canonical full name resolved from destCode (e.g. "New Carrollton")
@@ -41,6 +45,23 @@ interface Train {
   loc: string;
 }
 interface Incident { lines: LineCode[]; type: string; text: string }
+
+// Info-tab data. Both are near-static and cached in the DO (station times daily,
+// elevator/escalator outages every 5 min alongside incidents).
+type Weekday = 'Monday' | 'Tuesday' | 'Wednesday' | 'Thursday' | 'Friday' | 'Saturday' | 'Sunday';
+const WEEKDAYS: readonly Weekday[] =
+  ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+interface SchedTrain { time: string; dest: string }   // dest = canonical station name
+interface DaySched { open: string; first: SchedTrain[]; last: SchedTrain[] }
+type WeekSched = Partial<Record<Weekday, DaySched>>;
+type StationTimes = Record<string, WeekSched>;          // keyed by platform code
+interface ElevatorOutage {
+  station: string;                                       // platform code
+  unit: 'ELEVATOR' | 'ESCALATOR';
+  location: string;
+  reason: string;
+  returns: string | null;                               // ISO estimated return, if any
+}
 
 // ── Durable Object: the single source of truth for the cached snapshot. ─────
 // One global instance (named "global"), pinned to East-Coast North America
@@ -65,6 +86,18 @@ export class WmataCache extends DurableObject<Env> {
   async putStations(stations: Station[]): Promise<void> {
     await this.ctx.storage.put('stations', stations);
   }
+  async getStationTimes(): Promise<StationTimes | undefined> {
+    return this.ctx.storage.get<StationTimes>('stationtimes');
+  }
+  async putStationTimes(times: StationTimes): Promise<void> {
+    await this.ctx.storage.put('stationtimes', times);
+  }
+  async getElevator(): Promise<ElevatorOutage[] | undefined> {
+    return this.ctx.storage.get<ElevatorOutage[]>('elevator');
+  }
+  async putElevator(outages: ElevatorOutage[]): Promise<void> {
+    await this.ctx.storage.put('elevator', outages);
+  }
 }
 
 function cache(env: Env): DurableObjectStub<WmataCache> {
@@ -87,6 +120,8 @@ interface RawStation {
   Code: string; Name: string;
   LineCode1: string | null; LineCode2: string | null;
   LineCode3: string | null; LineCode4: string | null;
+  Lat?: number; Lon?: number;
+  Address?: { Street?: string; City?: string; State?: string; Zip?: string };
 }
 
 // Canonical display-name overrides, keyed by station code so they're stable
@@ -122,6 +157,17 @@ function adaptStations(raw: RawStation[]): Station[] {
     const rec = byName.get(name)!;
     if (!rec.codes.includes(st.Code)) rec.codes.push(st.Code);
     for (const l of lines) if (!rec.lines.includes(l)) rec.lines.push(l);
+    // Location is identical across a transfer station's platforms; keep the
+    // first non-empty. (Free — jStations already returns these fields.)
+    if (rec.lat == null && typeof st.Lat === 'number' && st.Lat !== 0) {
+      rec.lat = st.Lat; rec.lon = st.Lon;
+    }
+    if (!rec.address && st.Address?.Street) {
+      rec.address = {
+        street: st.Address.Street ?? '', city: st.Address.City ?? '',
+        state: st.Address.State ?? '', zip: st.Address.Zip ?? '',
+      };
+    }
   }
   return [...byName.values()]
     .filter((s) => s.lines.length > 0)
@@ -157,6 +203,50 @@ function adaptIncidents(raw: RawIncident[]): Incident[] {
     type: i.IncidentType ?? 'Advisory',
     text: i.Description ?? '',
   }));
+}
+
+// jStationTimes → per-code week schedule. Destination codes resolve to canonical
+// names so the Info tab reads "to Shady Grove", not "to A15".
+interface RawSchedTrain { Time?: string; DestinationStation?: string }
+interface RawDaySched { OpeningTime?: string; FirstTrains?: RawSchedTrain[]; LastTrains?: RawSchedTrain[] }
+type RawStationTime = { Code?: string; StationName?: string } & Partial<Record<Weekday, RawDaySched>>;
+
+function adaptStationTimes(raw: RawStationTime[], codeToName: Map<string, string>): StationTimes {
+  const mapTrains = (arr?: RawSchedTrain[]): SchedTrain[] =>
+    (arr ?? []).filter((t) => t.Time).map((t) => ({
+      time: t.Time!,
+      dest: (t.DestinationStation && codeToName.get(t.DestinationStation)) || t.DestinationStation || '—',
+    }));
+  const mapDay = (d?: RawDaySched): DaySched | undefined =>
+    d && d.OpeningTime ? { open: d.OpeningTime, first: mapTrains(d.FirstTrains), last: mapTrains(d.LastTrains) } : undefined;
+  const out: StationTimes = {};
+  for (const st of raw) {
+    if (!st.Code) continue;
+    const week: WeekSched = {};
+    for (const day of WEEKDAYS) {
+      const d = mapDay(st[day]);
+      if (d) week[day] = d;
+    }
+    out[st.Code] = week;
+  }
+  return out;
+}
+
+// ElevatorIncidents → per-station outage list (accessibility).
+interface RawElevator {
+  UnitType?: string; StationCode?: string;
+  LocationDescription?: string; SymptomDescription?: string; EstimatedReturnToService?: string;
+}
+function adaptElevator(raw: RawElevator[]): ElevatorOutage[] {
+  return raw
+    .filter((e) => e.StationCode && (e.UnitType === 'ELEVATOR' || e.UnitType === 'ESCALATOR'))
+    .map((e) => ({
+      station: e.StationCode!,
+      unit: e.UnitType as 'ELEVATOR' | 'ESCALATOR',
+      location: e.LocationDescription ?? '',
+      reason: e.SymptomDescription ?? '',
+      returns: e.EstimatedReturnToService || null,
+    }));
 }
 
 // ── GTFS-Realtime TripUpdates: the primary prediction source ─────────────────
@@ -544,6 +634,31 @@ async function fetchStations(env: Env): Promise<Station[]> {
     'Rail.svc/json/jStations', env.WMATA_KEY);
   return adaptStations(data.Stations ?? []);
 }
+async function fetchElevator(env: Env): Promise<ElevatorOutage[]> {
+  const data = await wmataGet<{ ElevatorIncidents?: RawElevator[] }>(
+    'Incidents.svc/json/ElevatorIncidents', env.WMATA_KEY);
+  return adaptElevator(data.ElevatorIncidents ?? []);
+}
+// jStationTimes with no StationCode returns all 102 stations in one call.
+async function fetchStationTimes(env: Env, codeToName: Map<string, string>): Promise<StationTimes> {
+  const data = await wmataGet<{ StationTimes?: RawStationTime[] }>(
+    'Rail.svc/json/jStationTimes', env.WMATA_KEY);
+  return adaptStationTimes(data.StationTimes ?? [], codeToName);
+}
+async function refreshElevator(env: Env): Promise<ElevatorOutage[]> {
+  const outages = await fetchElevator(env);
+  await cache(env).putElevator(outages);
+  return outages;
+}
+async function refreshStationTimes(env: Env): Promise<StationTimes> {
+  const c = cache(env);
+  const stations = applyNameOverrides((await c.getStations()) ?? (await refreshStations(env)));
+  const codeToName = new Map<string, string>();
+  for (const s of stations) for (const code of s.codes) codeToName.set(code, s.name);
+  const times = await fetchStationTimes(env, codeToName);
+  await c.putStationTimes(times);
+  return times;
+}
 
 // Resolve GetPrediction's raw/abbreviated destinations to canonical station
 // names. Only used on the fallback path — the GTFS-RT path resolves dest
@@ -688,10 +803,19 @@ export default {
         return;
       }
       case '*/5 * * * *':
-        ctx.waitUntil(refreshIncidents(env).then(() => undefined).catch((e) => console.error('incidents refresh failed', e)));
+        ctx.waitUntil(
+          Promise.all([refreshIncidents(env), refreshElevator(env)])
+            .then(() => undefined)
+            .catch((e) => console.error('incidents/elevator refresh failed', e)));
         return;
       case '17 6 * * *':
-        ctx.waitUntil(refreshStations(env).then(() => undefined).catch((e) => console.error('stations refresh failed', e)));
+        // Sequential: station times resolves destination codes against the
+        // freshly-refreshed station list.
+        ctx.waitUntil(
+          refreshStations(env)
+            .then(() => refreshStationTimes(env))
+            .then(() => undefined)
+            .catch((e) => console.error('daily refresh failed', e)));
         return;
       default:
         console.warn('unmatched cron', controller.cron);
@@ -731,6 +855,26 @@ export default {
         const codeSet = new Set(codes);
         const subset = all.filter((t) => codeSet.has(t.loc));
         return json(subset, { cacheControl: CC_PREDICTIONS });
+      }
+
+      const timesMatch = /^station-times\/([^/]+)\/?$/.exec(path);
+      if (timesMatch) {
+        const codes = parseCodes(timesMatch[1]);
+        if (!codes) return json({ error: 'invalid_codes' }, { status: 400 });
+        const all = (await c.getStationTimes()) ?? (await refreshStationTimes(env));
+        const subset: StationTimes = {};
+        for (const code of codes) if (all[code]) subset[code] = all[code];
+        return json(subset, { cacheControl: CC_STATIONS });
+      }
+
+      const elevMatch = /^elevator\/([^/]+)\/?$/.exec(path);
+      if (elevMatch) {
+        const codes = parseCodes(elevMatch[1]);
+        if (!codes) return json({ error: 'invalid_codes' }, { status: 400 });
+        const all = (await c.getElevator()) ?? (await refreshElevator(env));
+        const codeSet = new Set(codes);
+        const subset = all.filter((e) => codeSet.has(e.station));
+        return json(subset, { cacheControl: CC_INCIDENTS });
       }
 
       // Trivial liveness check, handy for uptime monitors.

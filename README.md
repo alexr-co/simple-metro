@@ -7,6 +7,8 @@ A fast, real-time arrivals board for the Washington DC Metro.
 - Real-time train predictions for every WMATA Metrorail platform — up to 5 upcoming
   trains per direction with real predicted arrival times and car counts — plus service
   incidents and the full station list.
+- A per-station **Info tab**: whether the station is open now, first/last trains today,
+  street address with a maps link, live elevator/escalator outages, and service alerts.
 - Clean per-station URLs (e.g. `/stations/dca`, `/stations/dupont-circle`) with short
   aliases for airports and well-known stops.
 
@@ -19,14 +21,15 @@ Two deployables behind a single domain, joined at Cloudflare's edge:
   WMATA and serves a small, normalized JSON API. A **Durable Object** (`WmataCache`,
   pinned to the US East coast) holds a single globally strongly-consistent snapshot,
   pre-warmed by cron triggers: predictions (~every 20s via in-handler fan-out), incidents
-  (every 5 min), and the station list (daily). One upstream fetch serves every user, so
-  WMATA load stays small and constant (~9,000 calls/day, well under WMATA's 50k/day limit)
-  regardless of traffic.
+  and elevator/escalator status (every 5 min), and the station list plus first/last-train
+  schedules (daily). One upstream fetch serves every user, so WMATA load stays small and
+  constant (~9,000 calls/day, well under WMATA's 50k/day limit) regardless of traffic.
 - **Edge routing** — Cloudflare intercepts `metro.alexr-co.com/api/*` and dispatches to
   the Worker; all other paths fall through to the Firebase-hosted SPA.
 
 Endpoints: `/api/wmata/stations`, `/api/wmata/incidents`,
-`/api/wmata/predictions/:codes`.
+`/api/wmata/predictions/:codes`, `/api/wmata/station-times/:codes`,
+`/api/wmata/elevator/:codes`.
 
 ### Data sources
 Predictions come from WMATA's **GTFS-Realtime** feeds — a public, binary (protobuf)
@@ -44,6 +47,11 @@ The Worker decodes both feeds with a small, **dependency-free protobuf reader** 
 compiler and no `protobufjs` dependency. If the GTFS-RT feed is ever unavailable, the
 Worker falls back to WMATA's legacy `GetPrediction` JSON endpoint (nearest ~3 trains) so
 the board never goes blank.
+
+The **Info tab** draws on the classic JSON endpoints, cached in the same Durable Object:
+station address and coordinates come free from the daily `jStations` fetch; first/last
+trains from a single daily `jStationTimes` call; and elevator/escalator outages from
+`ElevatorIncidents`, refreshed every 5 minutes.
 
 ## Local development
 ```bash

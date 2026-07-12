@@ -8,7 +8,9 @@
      - Otherwise '/api/wmata' — same-origin, served via the Worker route
        once Phase 4 is in place. In dev, Vite proxies /api → wrangler dev. */
 
-import type { Station, Train, Incident, LineCode } from './metro-data';
+import type {
+  Station, Train, Incident, LineCode, StationTimes, ElevatorOutage,
+} from './metro-data';
 
 const BASE = import.meta.env.VITE_API_BASE
   ? `${String(import.meta.env.VITE_API_BASE).replace(/\/+$/, '')}/api/wmata`
@@ -32,5 +34,13 @@ export function getIncidents(signal?: AbortSignal): Promise<Incident[]> {
   return getJson<Incident[]>('incidents', signal);
 }
 
+export function getStationTimes(codes: string[], signal?: AbortSignal): Promise<StationTimes> {
+  return getJson<StationTimes>(`station-times/${codes.join(',')}`, signal);
+}
+
+export function getElevator(codes: string[], signal?: AbortSignal): Promise<ElevatorOutage[]> {
+  return getJson<ElevatorOutage[]>(`elevator/${codes.join(',')}`, signal);
+}
+
 // Re-export for convenience so consumers don't need to import from two places.
-export type { Station, Train, Incident, LineCode };
+export type { Station, Train, Incident, LineCode, StationTimes, ElevatorOutage };

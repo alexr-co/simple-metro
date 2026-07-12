@@ -3,6 +3,7 @@ import { flushSync } from 'react-dom';
 import {
   LINES, STATIONS as FALLBACK_STATIONS,
   type LineCode, type Station, type Train, type Incident,
+  type Weekday, type StationTimes, type SchedTrain, type ElevatorOutage,
 } from './lib/metro-data';
 import * as api from './lib/metro-api';
 import { parseStationSlug, stationFromSlug, stationPath, SLUG_ALIASES } from './lib/urls';
@@ -32,6 +33,93 @@ const minRank = (m: string): number => {
 };
 const lineOf = (code: LineCode | null) =>
   code && LINES[code] ? LINES[code] : { name: String(code ?? '—'), color: '#888', ink: '#fff' };
+
+// ── Info-tab time helpers ─────────────────────────────────────
+// WMATA schedules run on Eastern Time; a "service day" ends after midnight (a
+// last train at 00:06 belongs to the prior day). All the wrap handling below is
+// in minutes-from-midnight, with after-midnight times pushed past 1440.
+const WEEK: Weekday[] =
+  ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const prevDay = (d: Weekday): Weekday => WEEK[(WEEK.indexOf(d) + 6) % 7];
+const nextDay = (d: Weekday): Weekday => WEEK[(WEEK.indexOf(d) + 1) % 7];
+const hhmmToMin = (t: string): number => {
+  const [h, m] = t.split(':').map(Number);
+  return h * 60 + m;
+};
+function fmt12(min: number): string {
+  const m = ((Math.round(min) % 1440) + 1440) % 1440;
+  const h = Math.floor(m / 60), mm = m % 60;
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${String(mm).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`;
+}
+function nowInET(): { weekday: Weekday; minutes: number } {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', weekday: 'long',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date());
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+  let hour = Number(get('hour'));
+  if (hour === 24) hour = 0;   // some runtimes emit "24" at midnight
+  return { weekday: get('weekday') as Weekday, minutes: hour * 60 + Number(get('minute')) };
+}
+
+// Combined open/last-train window across a station's platforms for one day.
+function stationWindow(
+  codes: string[], times: StationTimes, day: Weekday,
+): { open: number; last: number } | null {
+  const wins = codes.flatMap((c) => {
+    const d = times[c]?.[day];
+    if (!d || !d.open || !d.last.length) return [];
+    const open = hhmmToMin(d.open);
+    const last = Math.max(...d.last.map((t) => {
+      const m = hhmmToMin(t.time);
+      return m < open ? m + 1440 : m;   // after-midnight → wrap
+    }));
+    return [{ open, last }];
+  });
+  if (!wins.length) return null;
+  return { open: Math.min(...wins.map((w) => w.open)), last: Math.max(...wins.map((w) => w.last)) };
+}
+
+// "Open · last train 12:06 AM" / "Closed · opens 5:14 AM", best-effort.
+function operatingStatus(codes: string[], times: StationTimes): { open: boolean; text: string } | null {
+  const { weekday, minutes } = nowInET();
+  const today = stationWindow(codes, times, weekday);
+  if (!today) return null;
+  if (minutes >= today.open && minutes <= today.last) {
+    return { open: true, text: `Open · last train ${fmt12(today.last)}` };
+  }
+  if (minutes < today.open) {
+    // Might still be in the after-midnight tail of yesterday's service.
+    const y = stationWindow(codes, times, prevDay(weekday));
+    if (y && y.last > 1440 && minutes <= y.last - 1440) {
+      return { open: true, text: `Open · last train ${fmt12(y.last)}` };
+    }
+    return { open: false, text: `Closed · opens ${fmt12(today.open)}` };
+  }
+  const tomorrow = stationWindow(codes, times, nextDay(weekday));
+  return { open: false, text: tomorrow ? `Closed · opens ${fmt12(tomorrow.open)}` : 'Closed' };
+}
+
+// Flatten first/last trains across platforms for a day, sorted by time
+// (after-midnight last trains sort to the end).
+function dayTrains(
+  codes: string[], times: StationTimes, day: Weekday, which: 'first' | 'last',
+): SchedTrain[] {
+  const all = codes.flatMap((c) => times[c]?.[day]?.[which] ?? []);
+  const key = (t: string) => {
+    const m = hhmmToMin(t);
+    return which === 'last' && m < 180 ? m + 1440 : m;
+  };
+  return [...all].sort((a, b) => key(a.time) - key(b.time));
+}
+function fmtReturn(iso: string | null): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime())
+    ? null
+    : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' });
+}
 
 // ── presentational bits ───────────────────────────────────────
 function LineTile({ code, size = 22 }: { code: LineCode | null; size?: number }) {
@@ -76,6 +164,116 @@ function Platform({ trains }: { trains: Train[] }) {
       {sorted.length === 0
         ? <div className="mx-empty">No trains scheduled</div>
         : sorted.map((t, i) => <ArrivalRow key={i} t={t} lead={i === 0} />)}
+    </div>
+  );
+}
+
+// ── Info tab ──────────────────────────────────────────────────
+function SchedList({ label, trains }: { label: string; trains: SchedTrain[] }) {
+  if (!trains.length) return null;
+  return (
+    <div className="mx-sched">
+      <div className="mx-sched-label">{label}</div>
+      <div className="mx-sched-rows">
+        {trains.map((t, i) => (
+          <div className="mx-sched-row" key={i}>
+            <span className="mx-sched-dest">{t.dest}</span>
+            <span className="mx-sched-time">{fmt12(hhmmToMin(t.time))}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function InfoTab({ station, times, elevator, incidents, loading, error }: {
+  station: Station;
+  times: StationTimes | null;
+  elevator: ElevatorOutage[];
+  incidents: Incident[];
+  loading: boolean;
+  error: boolean;
+}) {
+  if (!times) {
+    if (loading) return <div className="mx-loading">Loading station info…</div>;
+    if (error) return (
+      <div className="mx-noarrivals">
+        <div className="mx-noarrivals-title">Couldn’t load station info</div>
+        <div className="mx-loaderror-sub">Switch tabs and back to retry.</div>
+      </div>
+    );
+    return null;
+  }
+  const today = nowInET().weekday;
+  const status = operatingStatus(station.codes, times);
+  const first = dayTrains(station.codes, times, today, 'first');
+  const last = dayTrains(station.codes, times, today, 'last');
+  // Prefer the human address for the Maps query (opens the named place, not a
+  // bare pin); fall back to coordinates, then the station name.
+  const mapsQuery = station.address
+    ? `${station.address.street}, ${station.address.city}, ${station.address.state} ${station.address.zip}`
+    : station.lat != null ? `${station.lat},${station.lon}` : station.name;
+  const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(mapsQuery)}`;
+
+  return (
+    <div className="mx-info">
+      {status && (
+        <div className={'mx-infocard mx-opstatus ' + (status.open ? 'open' : 'closed')}>
+          <span className="mx-opdot" />
+          <span>{status.text}</span>
+        </div>
+      )}
+
+      {station.address && (
+        <div className="mx-infocard">
+          <div className="mx-infocard-title">Station</div>
+          <div className="mx-address">{station.address.street}</div>
+          <div className="mx-address">
+            {station.address.city}, {station.address.state} {station.address.zip}
+          </div>
+          <a className="mx-maplink" href={mapsUrl} target="_blank" rel="noreferrer">
+            Open in Maps →
+          </a>
+        </div>
+      )}
+
+      {incidents.length > 0 && (
+        <div className="mx-infocard">
+          <div className="mx-infocard-title">Service alerts</div>
+          {incidents.map((inc, i) => (
+            <div className="mx-info-alert" key={i}>{inc.text}</div>
+          ))}
+        </div>
+      )}
+
+      <div className="mx-infocard">
+        <div className="mx-infocard-title">Elevators &amp; escalators</div>
+        {elevator.length === 0 ? (
+          <div className="mx-eles-ok">All in service</div>
+        ) : (
+          elevator.map((e, i) => {
+            const ret = fmtReturn(e.returns);
+            return (
+              <div className="mx-eles-row" key={i}>
+                <span className="mx-eles-unit">{e.unit === 'ELEVATOR' ? 'Elevator' : 'Escalator'}</span>
+                <div className="mx-eles-detail">
+                  <div>{e.location}</div>
+                  <div className="mx-eles-sub">{e.reason}{ret ? ` · est. return ${ret}` : ''}</div>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      <div className="mx-infocard">
+        <div className="mx-infocard-title">First &amp; last trains today</div>
+        <SchedList label="First" trains={first} />
+        <SchedList label="Last" trains={last} />
+        {first.length === 0 && last.length === 0 && (
+          <div className="mx-info-empty">No scheduled times available.</div>
+        )}
+      </div>
     </div>
   );
 }
@@ -303,6 +501,14 @@ export default function App() {
   const [spin, setSpin] = useState(0);
   const reqId = useRef(0);
 
+  // Info tab: which tab is active, and its lazily-loaded (near-static) data.
+  // times/elevator reset to null/[] on station change so the tab refetches.
+  const [tab, setTab] = useState<'arrivals' | 'info'>('arrivals');
+  const [times, setTimes] = useState<StationTimes | null>(null);
+  const [elevator, setElevator] = useState<ElevatorOutage[]>([]);
+  const [infoLoading, setInfoLoading] = useState(false);
+  const [infoError, setInfoError] = useState(false);
+
   const station = stations.find((s) => s.name === stationName) ?? stations[0];
 
   // Try to upgrade the fallback list with the authoritative one from the backend.
@@ -342,10 +548,41 @@ export default function App() {
     setIncidents([]);
     setUpdatedAt(null);
     setFailing(false);
+    // New station also defaults back to Arrivals and clears the Info-tab cache.
+    setTab('arrivals');
+    setTimes(null);
+    setElevator([]);
+    setInfoError(false);
     load();
     const iv = setInterval(load, REFRESH_MS);
     return () => clearInterval(iv);
   }, [load]);
+
+  // Lazily load the Info tab's data the first time it's opened for a station.
+  // times resets to null on station change, so this refetches per station; once
+  // loaded, the effect re-runs but returns early (no loop).
+  useEffect(() => {
+    if (tab !== 'info' || !station || times) return;
+    let cancelled = false;
+    setInfoLoading(true);
+    setInfoError(false);
+    Promise.all([
+      api.getStationTimes(station.codes),
+      api.getElevator(station.codes).catch(() => [] as ElevatorOutage[]),
+    ])
+      .then(([t, e]) => {
+        if (cancelled) return;
+        setTimes(t);
+        setElevator(e);
+        setInfoLoading(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setInfoError(true);
+        setInfoLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [tab, station, times]);
 
   // 1s ticker for the "updated Xs ago" line.
   useEffect(() => {
@@ -452,9 +689,8 @@ export default function App() {
           </button>
         </div>
 
-        {/* Header alerts are collapsible context when there ARE trains. When
-            the board is empty (closure/end-of-service/etc.), alerts move down
-            into the empty-state block so they're immediately visible there. */}
+        {/* Service alerts sit directly under the live status and above the tabs,
+            so they're visible from both tabs. Full text is mirrored in Info. */}
         {incidents.length > 0 && trains.length > 0 && status !== 'error' && (
           <div className={'mx-alertbox' + (alertsOpen ? ' open' : '')}>
             <button className="mx-alerttoggle" onClick={() => setAlertsOpen((o) => !o)}>
@@ -481,45 +717,72 @@ export default function App() {
         )}
       </section>
 
-      <main className="mx-board">
-        {status === 'loading' && (
-          <div className="mx-loading">Loading arrivals…</div>
-        )}
-        {/* Too stale / never loaded: hide the arrivals (they'd be misleading)
-            and say so. The refresh loop keeps retrying, so this clears itself
-            once the backend is reachable again. */}
-        {status === 'error' && (
-          <div className="mx-noarrivals mx-loaderror">
-            <div className="mx-noarrivals-title">Unable to load train data</div>
-            <div className="mx-loaderror-sub">Check your connection — retrying automatically.</div>
-          </div>
-        )}
-        {/* Empty-state: all platforms returned no trains. Could be a closure,
-            end of service hours, or a transient hiccup. If incidents apply to
-            this station's lines, render their text inline so the user sees
-            the explanation without tapping. */}
-        {(status === 'live' || status === 'reconnecting') && groupKeys.length === 0 && (
-          <div className="mx-noarrivals">
-            <div className="mx-noarrivals-title">No arrivals at this station</div>
-            {incidents.length > 0 && (
-              <div className="mx-noarrivals-alerts">
-                {incidents.slice(0, 4).map((inc, i) => (
-                  <div className="mx-noarrivals-alert" key={i}>
-                    <svg width="13" height="13" viewBox="0 0 18 18" aria-hidden="true">
-                      <path d="M9 1.5 17 16H1L9 1.5Z" fill="var(--warn)" />
-                      <rect x="8.1" y="6.4" width="1.8" height="5" rx="0.9" fill="#14130E" />
-                      <circle cx="9" cy="13.2" r="1" fill="#14130E" />
-                    </svg>
-                    <span>{inc.text}</span>
-                  </div>
-                ))}
+      <nav className="mx-tabs" role="tablist">
+        <button type="button" role="tab" aria-selected={tab === 'arrivals'}
+                className={'mx-tab' + (tab === 'arrivals' ? ' active' : '')}
+                onClick={() => setTab('arrivals')}>
+          Arrivals
+        </button>
+        <button type="button" role="tab" aria-selected={tab === 'info'}
+                className={'mx-tab' + (tab === 'info' ? ' active' : '')}
+                onClick={() => setTab('info')}>
+          Info
+          {incidents.length > 0 && (
+            <span className="mx-tabbadge" aria-label="has service alerts" />
+          )}
+        </button>
+      </nav>
+
+      {tab === 'arrivals' && (
+        <>
+          <main className="mx-board">
+            {status === 'loading' && (
+              <div className="mx-loading">Loading arrivals…</div>
+            )}
+            {/* Too stale / never loaded: hide the arrivals (they'd be misleading)
+                and say so. The refresh loop keeps retrying, so this clears itself
+                once the backend is reachable again. */}
+            {status === 'error' && (
+              <div className="mx-noarrivals mx-loaderror">
+                <div className="mx-noarrivals-title">Unable to load train data</div>
+                <div className="mx-loaderror-sub">Check your connection — retrying automatically.</div>
               </div>
             )}
-          </div>
-        )}
-        {(status === 'live' || status === 'reconnecting') &&
-          groupKeys.map((g) => <Platform key={g} trains={groups[g]} />)}
-      </main>
+            {/* Empty-state: all platforms returned no trains. Could be a closure,
+                end of service hours, or a transient hiccup. If incidents apply to
+                this station's lines, render their text inline so the user sees
+                the explanation without tapping. */}
+            {(status === 'live' || status === 'reconnecting') && groupKeys.length === 0 && (
+              <div className="mx-noarrivals">
+                <div className="mx-noarrivals-title">No arrivals at this station</div>
+                {incidents.length > 0 && (
+                  <div className="mx-noarrivals-alerts">
+                    {incidents.slice(0, 4).map((inc, i) => (
+                      <div className="mx-noarrivals-alert" key={i}>
+                        <svg width="13" height="13" viewBox="0 0 18 18" aria-hidden="true">
+                          <path d="M9 1.5 17 16H1L9 1.5Z" fill="var(--warn)" />
+                          <rect x="8.1" y="6.4" width="1.8" height="5" rx="0.9" fill="#14130E" />
+                          <circle cx="9" cy="13.2" r="1" fill="#14130E" />
+                        </svg>
+                        <span>{inc.text}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {(status === 'live' || status === 'reconnecting') &&
+              groupKeys.map((g) => <Platform key={g} trains={groups[g]} />)}
+          </main>
+        </>
+      )}
+
+      {tab === 'info' && station && (
+        <main className="mx-board">
+          <InfoTab station={station} times={times} elevator={elevator}
+                   incidents={incidents} loading={infoLoading} error={infoError} />
+        </main>
+      )}
 
       <footer className="mx-picker">
         <div className="mx-pickerlabel">Station</div>
