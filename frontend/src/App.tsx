@@ -121,20 +121,6 @@ function fmtReturn(iso: string | null): string | null {
     : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' });
 }
 
-// Maps link → Google Maps, which reliably drops a pin on the exact coordinate
-// everywhere: it opens the Google Maps app on Android and iOS (when installed)
-// via universal links, and the web otherwise. Query the coordinate (not a name
-// or address) so the pin lands precisely on the WMATA station point; fall back
-// to the address, then the name, only when coordinates are unavailable.
-function mapsHref(station: Station): string {
-  const query = station.lat != null && station.lon != null
-    ? `${station.lat},${station.lon}`
-    : station.address
-      ? `${station.address.street}, ${station.address.city}, ${station.address.state} ${station.address.zip}`
-      : station.name;
-  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
-}
-
 // ── presentational bits ───────────────────────────────────────
 function LineTile({ code, size = 22 }: { code: LineCode | null; size?: number }) {
   const ln = lineOf(code);
@@ -222,7 +208,12 @@ function InfoTab({ station, times, elevator, incidents, loading, error }: {
   const status = operatingStatus(station.codes, times);
   const first = dayTrains(station.codes, times, today, 'first');
   const last = dayTrains(station.codes, times, today, 'last');
-  const mapsUrl = mapsHref(station);
+  // Prefer the human address for the Maps query (opens the named place, not a
+  // bare pin); fall back to coordinates, then the station name.
+  const mapsQuery = station.address
+    ? `${station.address.street}, ${station.address.city}, ${station.address.state} ${station.address.zip}`
+    : station.lat != null ? `${station.lat},${station.lon}` : station.name;
+  const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(mapsQuery)}`;
 
   return (
     <div className="mx-info">
