@@ -41,7 +41,10 @@ body {
   background: var(--paper); color: var(--ink);
   font-family: var(--sign);
   position: relative; overflow: hidden;
-  min-height: 100dvh;
+  /* Fixed viewport height (not min-height) so the column is bounded: the board
+     scrolls internally and the station picker stays pinned at the bottom. dvh
+     tracks the mobile URL bar so the picker never hides behind it. */
+  height: 100dvh;
 }
 .mx-root[data-theme="dark"] {
   --paper: #100f0b;
@@ -125,7 +128,9 @@ body {
 @keyframes mxspin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
 
 /* ── board ── */
-.mx-board { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+/* min-height:0 lets this flex child shrink below its content height so it
+   scrolls internally instead of pushing the picker off the bottom. */
+.mx-board { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .mx-plat-block { border-top: 1.5px solid var(--rule-strong); }
 
 .mx-row {
