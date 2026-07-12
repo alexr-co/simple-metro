@@ -837,9 +837,13 @@ export default {
       const c = cache(env);
 
       if (path === 'stations' || path === 'stations/') {
-        const stations = applyNameOverrides(
-          (await c.getStations()) ?? (await refreshStations(env)));
-        return json(stations, { cacheControl: CC_STATIONS });
+        let cached = await c.getStations();
+        // Self-heal a snapshot left over from before address/coords were added,
+        // instead of waiting for the daily refresh (the DO persists across deploys).
+        if (!cached || cached.length === 0 || !cached.some((s) => s.address)) {
+          cached = await refreshStations(env);
+        }
+        return json(applyNameOverrides(cached), { cacheControl: CC_STATIONS });
       }
 
       if (path === 'incidents' || path === 'incidents/') {
