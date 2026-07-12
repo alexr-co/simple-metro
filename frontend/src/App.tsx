@@ -509,6 +509,16 @@ export default function App() {
   const [infoLoading, setInfoLoading] = useState(false);
   const [infoError, setInfoError] = useState(false);
 
+  // Scroll cue: a bottom fade + chevron shown while the board still has content
+  // below the fold, so a long arrivals/info list reads as scrollable. Hidden the
+  // moment you reach the bottom (or when nothing overflows).
+  const boardRef = useRef<HTMLElement>(null);
+  const [canScrollDown, setCanScrollDown] = useState(false);
+  const recomputeCue = useCallback(() => {
+    const el = boardRef.current;
+    setCanScrollDown(!!el && el.scrollHeight - el.scrollTop - el.clientHeight > 8);
+  }, []);
+
   const station = stations.find((s) => s.name === stationName) ?? stations[0];
 
   // Try to upgrade the fallback list with the authoritative one from the backend.
@@ -662,6 +672,18 @@ export default function App() {
     : elapsed < 60  ? `updated ${elapsed}s ago`
     : `updated ${Math.floor(elapsed / 60)}m ago`;
 
+  // Keep the scroll cue in sync: recompute on content-height changes (tab/data/
+  // status) and on viewport-height changes (resize / on-screen keyboard).
+  useEffect(() => { recomputeCue(); },
+    [recomputeCue, tab, trains, times, elevator, incidents, status]);
+  useEffect(() => {
+    const el = boardRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(recomputeCue);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [recomputeCue, tab]);
+
   return (
     <div className="mx-root" data-theme={dark ? 'dark' : 'light'}>
       <section className="mx-station">
@@ -733,56 +755,62 @@ export default function App() {
         </button>
       </nav>
 
-      {tab === 'arrivals' && (
-        <>
-          <main className="mx-board">
-            {status === 'loading' && (
-              <div className="mx-loading">Loading arrivals…</div>
-            )}
-            {/* Too stale / never loaded: hide the arrivals (they'd be misleading)
-                and say so. The refresh loop keeps retrying, so this clears itself
-                once the backend is reachable again. */}
-            {status === 'error' && (
-              <div className="mx-noarrivals mx-loaderror">
-                <div className="mx-noarrivals-title">Unable to load train data</div>
-                <div className="mx-loaderror-sub">Check your connection — retrying automatically.</div>
-              </div>
-            )}
-            {/* Empty-state: all platforms returned no trains. Could be a closure,
-                end of service hours, or a transient hiccup. If incidents apply to
-                this station's lines, render their text inline so the user sees
-                the explanation without tapping. */}
-            {(status === 'live' || status === 'reconnecting') && groupKeys.length === 0 && (
-              <div className="mx-noarrivals">
-                <div className="mx-noarrivals-title">No arrivals at this station</div>
-                {incidents.length > 0 && (
-                  <div className="mx-noarrivals-alerts">
-                    {incidents.slice(0, 4).map((inc, i) => (
-                      <div className="mx-noarrivals-alert" key={i}>
-                        <svg width="13" height="13" viewBox="0 0 18 18" aria-hidden="true">
-                          <path d="M9 1.5 17 16H1L9 1.5Z" fill="var(--warn)" />
-                          <rect x="8.1" y="6.4" width="1.8" height="5" rx="0.9" fill="#14130E" />
-                          <circle cx="9" cy="13.2" r="1" fill="#14130E" />
-                        </svg>
-                        <span>{inc.text}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-            {(status === 'live' || status === 'reconnecting') &&
-              groupKeys.map((g) => <Platform key={g} trains={groups[g]} />)}
-          </main>
-        </>
-      )}
-
-      {tab === 'info' && station && (
-        <main className="mx-board">
-          <InfoTab station={station} times={times} elevator={elevator}
-                   incidents={incidents} loading={infoLoading} error={infoError} />
+      <div className="mx-boardwrap">
+        <main className="mx-board" ref={boardRef} onScroll={recomputeCue}>
+          {tab === 'arrivals' ? (
+            <>
+              {status === 'loading' && (
+                <div className="mx-loading">Loading arrivals…</div>
+              )}
+              {/* Too stale / never loaded: hide the arrivals (they'd be misleading)
+                  and say so. The refresh loop keeps retrying, so this clears itself
+                  once the backend is reachable again. */}
+              {status === 'error' && (
+                <div className="mx-noarrivals mx-loaderror">
+                  <div className="mx-noarrivals-title">Unable to load train data</div>
+                  <div className="mx-loaderror-sub">Check your connection — retrying automatically.</div>
+                </div>
+              )}
+              {/* Empty-state: all platforms returned no trains. Could be a closure,
+                  end of service hours, or a transient hiccup. If incidents apply to
+                  this station's lines, render their text inline so the user sees
+                  the explanation without tapping. */}
+              {(status === 'live' || status === 'reconnecting') && groupKeys.length === 0 && (
+                <div className="mx-noarrivals">
+                  <div className="mx-noarrivals-title">No arrivals at this station</div>
+                  {incidents.length > 0 && (
+                    <div className="mx-noarrivals-alerts">
+                      {incidents.slice(0, 4).map((inc, i) => (
+                        <div className="mx-noarrivals-alert" key={i}>
+                          <svg width="13" height="13" viewBox="0 0 18 18" aria-hidden="true">
+                            <path d="M9 1.5 17 16H1L9 1.5Z" fill="var(--warn)" />
+                            <rect x="8.1" y="6.4" width="1.8" height="5" rx="0.9" fill="#14130E" />
+                            <circle cx="9" cy="13.2" r="1" fill="#14130E" />
+                          </svg>
+                          <span>{inc.text}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {(status === 'live' || status === 'reconnecting') &&
+                groupKeys.map((g) => <Platform key={g} trains={groups[g]} />)}
+            </>
+          ) : station ? (
+            <InfoTab station={station} times={times} elevator={elevator}
+                     incidents={incidents} loading={infoLoading} error={infoError} />
+          ) : null}
         </main>
-      )}
+        {/* Scroll cue: fade + bobbing chevron, only while more content lies below.
+            Non-interactive so it never blocks a tap or scroll. */}
+        <div className={'mx-scrollcue' + (canScrollDown ? ' show' : '')} aria-hidden="true">
+          <svg className="mx-scrollcue-chev" width="20" height="20" viewBox="0 0 24 24">
+            <path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2.4"
+                  fill="none" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </div>
+      </div>
 
       <footer className="mx-picker">
         <div className="mx-pickerlabel">Station</div>
