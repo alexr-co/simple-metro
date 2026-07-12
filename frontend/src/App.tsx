@@ -121,44 +121,18 @@ function fmtReturn(iso: string | null): string | null {
     : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' });
 }
 
-// Maps link that respects the user's map app where the OS allows it. On Android
-// the geo: URI hands off to whatever map app the user has set as default (or the
-// app chooser). iOS has no user-settable default map app, so links there open
-// Apple Maps. Desktop opens Google Maps on the web (new tab). newTab is false for
-// the mobile schemes so the app takes over without leaving a stray blank tab.
-function mapsHref(station: Station): { href: string; newTab: boolean } {
-  const ll = station.lat != null && station.lon != null ? `${station.lat},${station.lon}` : null;
-  const addr = station.address
-    ? `${station.address.street}, ${station.address.city}, ${station.address.state} ${station.address.zip}`
-    : station.name;
-  const label = encodeURIComponent(station.name);
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
-  const isIOS = /iP(hone|ad|od)/.test(ua)
-    || (typeof navigator !== 'undefined' && navigator.platform === 'MacIntel' && (navigator.maxTouchPoints ?? 0) > 1);
-
-  if (/Android/.test(ua)) {
-    return {
-      href: ll ? `geo:${ll}?q=${ll}(${label})` : `geo:0,0?q=${encodeURIComponent(addr)}`,
-      newTab: false,
-    };
-  }
-  if (isIOS) {
-    // A bare `ll` only recenters the map (no marker); a name or address
-    // geocodes unreliably for transit stops. Searching the coordinate itself
-    // (`q=lat,lon`) makes Apple Maps drop an actual pin on the exact WMATA
-    // point. Fall back to address, then name, only when coordinates are absent.
-    return {
-      href: ll
-        ? `https://maps.apple.com/?q=${ll}`
-        : station.address ? `https://maps.apple.com/?address=${encodeURIComponent(addr)}`
-        : `https://maps.apple.com/?q=${encodeURIComponent(station.name)}`,
-      newTab: false,
-    };
-  }
-  return {
-    href: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(ll ?? addr)}`,
-    newTab: true,
-  };
+// Maps link → Google Maps, which reliably drops a pin on the exact coordinate
+// everywhere: it opens the Google Maps app on Android and iOS (when installed)
+// via universal links, and the web otherwise. Query the coordinate (not a name
+// or address) so the pin lands precisely on the WMATA station point; fall back
+// to the address, then the name, only when coordinates are unavailable.
+function mapsHref(station: Station): string {
+  const query = station.lat != null && station.lon != null
+    ? `${station.lat},${station.lon}`
+    : station.address
+      ? `${station.address.street}, ${station.address.city}, ${station.address.state} ${station.address.zip}`
+      : station.name;
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
 }
 
 // ── presentational bits ───────────────────────────────────────
@@ -248,7 +222,7 @@ function InfoTab({ station, times, elevator, incidents, loading, error }: {
   const status = operatingStatus(station.codes, times);
   const first = dayTrains(station.codes, times, today, 'first');
   const last = dayTrains(station.codes, times, today, 'last');
-  const maps = mapsHref(station);
+  const mapsUrl = mapsHref(station);
 
   return (
     <div className="mx-info">
@@ -266,8 +240,7 @@ function InfoTab({ station, times, elevator, incidents, loading, error }: {
           <div className="mx-address">
             {station.address.city}, {station.address.state} {station.address.zip}
           </div>
-          <a className="mx-maplink" href={maps.href}
-             {...(maps.newTab ? { target: '_blank', rel: 'noreferrer' } : {})}>
+          <a className="mx-maplink" href={mapsUrl} target="_blank" rel="noreferrer">
             Open in Maps →
           </a>
         </div>
