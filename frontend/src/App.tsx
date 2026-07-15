@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { flushSync } from 'react-dom';
 import {
   LINES, STATIONS as FALLBACK_STATIONS,
@@ -33,6 +33,34 @@ const minRank = (m: string): number => {
 };
 const lineOf = (code: LineCode | null) =>
   code && LINES[code] ? LINES[code] : { name: String(code ?? '—'), color: '#888', ink: '#fff' };
+
+// Current time as an external store, ticking once per second. Subscribing
+// components re-render each second; nothing else does. (Reading Date.now()
+// directly in render is impure and re-rendered the whole app every tick.)
+const nowSecond = {
+  subscribe(cb: () => void) {
+    const iv = setInterval(cb, 1000);
+    return () => clearInterval(iv);
+  },
+  getSnapshot() {
+    return Math.floor(Date.now() / 1000);
+  },
+};
+const useNowSecond = () =>
+  useSyncExternalStore(nowSecond.subscribe, nowSecond.getSnapshot);
+
+// "updated Xs ago" label. Isolated so its 1s ticker re-renders only this
+// span, not the whole board.
+function UpdatedAgo({ updatedAt, failing }: { updatedAt: number | null; failing: boolean }) {
+  const nowSec = useNowSecond();
+  const elapsed = updatedAt == null ? null : Math.max(0, nowSec - Math.floor(updatedAt / 1000));
+  const text =
+    elapsed == null ? (failing ? 'no data' : 'updating…')
+    : elapsed < 2   ? 'updated just now'
+    : elapsed < 60  ? `updated ${elapsed}s ago`
+    : `updated ${Math.floor(elapsed / 60)}m ago`;
+  return <span className="mx-ago">{text}</span>;
+}
 
 // ── Info-tab time helpers ─────────────────────────────────────
 // WMATA schedules run on Eastern Time; a "service day" ends after midnight (a
@@ -299,28 +327,31 @@ function StationPicker({
   // typing (and the programmatic scroll-into-view on open).
   const touchingRef = useRef(false);
 
+  // Close + reset the query so the next open starts fresh. Every path that
+  // dismisses the picker goes through here.
+  // Focus is NOT done on open-side effects: iOS Safari only raises the
+  // on-screen keyboard when focus() runs synchronously inside the tap's own
+  // call stack, so it's handled in the trigger's onClick (a focus from an
+  // effect/rAF gets the caret but no keyboard on iOS — though it works on
+  // Android).
+  const close = useCallback(() => {
+    setOpen(false);
+    setQuery('');
+  }, []);
+
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) close();
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
     return () => {
       document.removeEventListener('mousedown', onDown);
       document.removeEventListener('keydown', onKey);
     };
-  }, [open]);
-
-  // Reset the query when the picker closes so the next open starts fresh.
-  // Focus is NOT done here: iOS Safari only raises the on-screen keyboard when
-  // focus() runs synchronously inside the tap's own call stack, so it's handled
-  // in the trigger's onClick (a focus from an effect/rAF gets the caret but no
-  // keyboard on iOS — though it works on Android).
-  useEffect(() => {
-    if (!open) setQuery('');
-  }, [open]);
+  }, [open, close]);
 
   // Only scroll the active option into view on a fresh, unfiltered open —
   // once the user is typing, the list reorders to the matches anyway.
@@ -361,7 +392,7 @@ function StationPicker({
     <div ref={wrapRef} className={'mx-selectwrap' + (open ? ' open' : '')}>
       <button type="button" className="mx-select"
               onClick={() => {
-                if (open) { setOpen(false); return; }
+                if (open) { close(); return; }
                 // flushSync mounts the menu (and its input) before this handler
                 // returns, so the focus() below still runs inside the tap's
                 // gesture — the only way iOS Safari will raise the keyboard.
@@ -398,7 +429,7 @@ function StationPicker({
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && filtered.length > 0) {
                   onChange(filtered[0].name);
-                  setOpen(false);
+                  close();
                 }
               }}
               aria-label="Search stations"
@@ -406,7 +437,7 @@ function StationPicker({
             {/* Dismiss control for the mobile full-screen overlay (hidden on
                 desktop, which closes via outside-click / Escape). */}
             <button type="button" className="mx-searchclose"
-                    onClick={() => setOpen(false)} aria-label="Close station search">
+                    onClick={close} aria-label="Close station search">
               Done
             </button>
           </div>
@@ -416,7 +447,7 @@ function StationPicker({
                 <button key={s.codes.join('-')} type="button" role="option"
                         aria-selected={s.name === value}
                         className={'mx-selectopt' + (s.name === value ? ' active' : '')}
-                        onClick={() => { onChange(s.name); setOpen(false); }}>
+                        onClick={() => { onChange(s.name); close(); }}>
                   {s.name}
                 </button>
               ))}
@@ -495,7 +526,6 @@ export default function App() {
   // these — see below. On failure we keep the last-good trains/incidents.
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const [failing, setFailing] = useState(false);
-  const [, setNowTick] = useState(0);
   const [sheet, setSheet] = useState(false);
   const [alertsOpen, setAlertsOpen] = useState(false);
   const [spin, setSpin] = useState(0);
@@ -506,7 +536,6 @@ export default function App() {
   const [tab, setTab] = useState<'arrivals' | 'info'>('arrivals');
   const [times, setTimes] = useState<StationTimes | null>(null);
   const [elevator, setElevator] = useState<ElevatorOutage[]>([]);
-  const [infoLoading, setInfoLoading] = useState(false);
   const [infoError, setInfoError] = useState(false);
 
   // Scroll cue: a bottom fade + chevron shown while the board still has content
@@ -520,6 +549,25 @@ export default function App() {
   }, []);
 
   const station = stations.find((s) => s.name === stationName) ?? stations[0];
+
+  // Station changed → drop the previous station's data so a failed first load
+  // shows the loading/error state rather than the wrong station's arrivals,
+  // default back to Arrivals, and clear the Info-tab cache. Done as a guarded
+  // state adjustment during render (React's sanctioned "adjust state when
+  // props change" pattern) — React re-renders immediately, before effects or
+  // any paint of the stale data.
+  const [renderedStation, setRenderedStation] = useState(station?.name);
+  if (station?.name !== renderedStation) {
+    setRenderedStation(station?.name);
+    setTrains([]);
+    setIncidents([]);
+    setUpdatedAt(null);
+    setFailing(false);
+    setTab('arrivals');
+    setTimes(null);
+    setElevator([]);
+    setInfoError(false);
+  }
 
   // Try to upgrade the fallback list with the authoritative one from the backend.
   useEffect(() => {
@@ -552,30 +600,21 @@ export default function App() {
   }, [station]);
 
   useEffect(() => {
-    // New station: drop the previous station's data so a failed first load
-    // shows the loading/error state rather than the wrong station's arrivals.
-    setTrains([]);
-    setIncidents([]);
-    setUpdatedAt(null);
-    setFailing(false);
-    // New station also defaults back to Arrivals and clears the Info-tab cache.
-    setTab('arrivals');
-    setTimes(null);
-    setElevator([]);
-    setInfoError(false);
-    load();
+    // First fetch via a 0ms timeout: load()'s state writes all land after its
+    // awaits, but scheduling it keeps this effect free of synchronous setState.
+    const t = setTimeout(load, 0);
     const iv = setInterval(load, REFRESH_MS);
-    return () => clearInterval(iv);
+    return () => { clearTimeout(t); clearInterval(iv); };
   }, [load]);
 
   // Lazily load the Info tab's data the first time it's opened for a station.
   // times resets to null on station change, so this refetches per station; once
-  // loaded, the effect re-runs but returns early (no loop).
+  // loaded, the effect re-runs but returns early (no loop). After a failure it
+  // waits for the user to leave and re-open the tab (the tab button's onClick
+  // clears infoError, which is what re-arms this fetch).
   useEffect(() => {
-    if (tab !== 'info' || !station || times) return;
+    if (tab !== 'info' || !station || times || infoError) return;
     let cancelled = false;
-    setInfoLoading(true);
-    setInfoError(false);
     Promise.all([
       api.getStationTimes(station.codes),
       api.getElevator(station.codes).catch(() => [] as ElevatorOutage[]),
@@ -584,21 +623,16 @@ export default function App() {
         if (cancelled) return;
         setTimes(t);
         setElevator(e);
-        setInfoLoading(false);
       })
       .catch(() => {
         if (cancelled) return;
         setInfoError(true);
-        setInfoLoading(false);
       });
     return () => { cancelled = true; };
-  }, [tab, station, times]);
-
-  // 1s ticker for the "updated Xs ago" line.
-  useEffect(() => {
-    const iv = setInterval(() => setNowTick((n) => n + 1), 1000);
-    return () => clearInterval(iv);
-  }, []);
+  }, [tab, station, times, infoError]);
+  // Loading = the fetch above is (or is about to be) in flight. Derived, so
+  // no synchronous setState is needed when the effect starts.
+  const infoLoading = tab === 'info' && !times && !infoError;
 
   const pickStation = (name: string) => {
     setStationName(name);
@@ -632,19 +666,20 @@ export default function App() {
   //   - unknown slug landed and we fell back → URL gets corrected
   //   - any other drift between URL and resolved station
   // replaceState (not pushState) so it doesn't create a back-button entry.
+  const activeName = station?.name;
   useEffect(() => {
-    if (!station) return;
-    const expected = stationPath(station.name);
+    if (!activeName) return;
+    const expected = stationPath(activeName);
     if (window.location.pathname !== expected) {
       window.history.replaceState({}, '', expected);
     }
-  }, [station?.name]);
+  }, [activeName]);
 
   // Document title: lets iOS Add-to-Home-Screen and tab/bookmark labels show
   // the active station rather than the generic landing title.
   useEffect(() => {
-    document.title = station ? `${station.name} | Metro` : 'Next Trains | Metro';
-  }, [station?.name]);
+    document.title = activeName ? `${activeName} | Metro` : 'Next Trains | Metro';
+  }, [activeName]);
 
   // Group trains by physical platform = station code + WMATA Group. Transfer
   // stations (Metro Center A01+C01, L'Enfant D03+F03) get all four platforms.
@@ -655,22 +690,24 @@ export default function App() {
   });
   const groupKeys = Object.keys(groups).sort();
 
+  // Staleness: a one-shot timer marks the current `updatedAt` as stale once it
+  // ages past STALE_MS. A new successful fetch changes `updatedAt`, which both
+  // re-arms the timer and (because `stale` compares against the marked value)
+  // resets staleness without any synchronous state write.
+  const [staleAsOf, setStaleAsOf] = useState<number | null>(null);
+  useEffect(() => {
+    if (updatedAt == null) return;
+    const t = setTimeout(() => setStaleAsOf(updatedAt), STALE_MS);
+    return () => clearTimeout(t);
+  }, [updatedAt]);
+  const stale = updatedAt != null && staleAsOf === updatedAt;
+
   // Derive the connection status from the last success + last-attempt flag.
-  // The 1s ticker above re-renders every second, so once `updatedAt` ages past
-  // STALE_MS this flips to 'error' on its own — no separate timer needed.
-  const age = updatedAt == null ? Infinity : Date.now() - updatedAt;
   const status: Status =
     updatedAt == null ? (failing ? 'error' : 'loading')
-    : age >= STALE_MS   ? 'error'
+    : stale             ? 'error'
     : failing           ? 'reconnecting'
     : 'live';
-
-  const elapsed = updatedAt == null ? null : Math.floor((Date.now() - updatedAt) / 1000);
-  const agoText =
-    elapsed == null ? (failing ? 'no data' : 'updating…')
-    : elapsed < 2   ? 'updated just now'
-    : elapsed < 60  ? `updated ${elapsed}s ago`
-    : `updated ${Math.floor(elapsed / 60)}m ago`;
 
   // Keep the scroll cue in sync: recompute on content-height changes (tab/data/
   // status) and on viewport-height changes (resize / on-screen keyboard).
@@ -702,7 +739,7 @@ export default function App() {
             <span className="mx-srclabel">{STATUS_LABEL[status]}</span>
           </button>
           <span className="mx-livesep">·</span>
-          <span className="mx-ago">{agoText}</span>
+          <UpdatedAgo updatedAt={updatedAt} failing={failing} />
           <button className="mx-refresh" onClick={refresh} aria-label="Refresh now">
             <svg key={spin} width="15" height="15" viewBox="0 0 16 16" fill="none">
               <path d="M13.5 8a5.5 5.5 0 1 1-1.7-3.95" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
@@ -747,7 +784,9 @@ export default function App() {
         </button>
         <button type="button" role="tab" aria-selected={tab === 'info'}
                 className={'mx-tab' + (tab === 'info' ? ' active' : '')}
-                onClick={() => setTab('info')}>
+                // Clearing infoError re-arms the lazy Info fetch — this is the
+                // "switch tabs and back to retry" path after a failed load.
+                onClick={() => { setTab('info'); setInfoError(false); }}>
           Info
           {incidents.length > 0 && (
             <span className="mx-tabbadge" aria-label="has service alerts" />
