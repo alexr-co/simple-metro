@@ -63,15 +63,52 @@ npm run dev:frontend        # Vite dev server
 npm run dev:worker          # wrangler dev (Cloudflare Worker)
 ```
 
-The Worker needs a WMATA API key as a secret (never committed):
+In dev, Vite proxies `/api` to `wrangler dev` on :8787 (run both commands). For
+local Worker data, put the WMATA key in `worker/.dev.vars` (gitignored):
+`WMATA_KEY=…`. In production the key is a Cloudflare secret (never committed):
 ```bash
 cd worker && npx wrangler secret put WMATA_KEY
 ```
 
-## Deploy
+`VITE_API_BASE` (build-time, optional): points the frontend at an absolute API
+origin (e.g. the workers.dev URL) instead of same-origin `/api/wmata`. If it's
+ever set to a cross-origin host, the CSP in `firebase.json` needs that host
+added to `connect-src`.
+
+Checks — the same ones CI runs before deploying:
 ```bash
-npm run deploy              # frontend (Firebase) + worker (Cloudflare)
+npm --prefix frontend run lint
+npm --prefix frontend run build
+npm --prefix worker run typecheck
+npm --prefix worker run test      # vitest: protobuf reader, fuzzy matcher, validation
 ```
+
+## Deploy
+**Canonical path: push to `main`.** The `Deploy` GitHub Actions workflow runs
+lint/typecheck/build/tests, then deploys the frontend to Firebase Hosting and
+the Worker to Cloudflare. `npm run deploy` is the manual escape hatch — it does
+the same two deploys from your machine using your local `firebase login` and
+`wrangler login` credentials, but skips the checks.
+
+Note on firebase-tools versions: CI pins `firebase-tools@13.35.1` because v14+
+rejects the Workload Identity Federation ADC file ("Failed to authenticate…");
+the root devDependency is v14, which is fine for manual deploys since those use
+interactive login, not WIF.
+
+### CI/CD configuration (GitHub repo settings)
+The `Deploy` workflow needs:
+
+| Kind | Name | Purpose |
+|---|---|---|
+| Variable | `WIF_PROVIDER` | Workload Identity Federation provider resource name (Firebase auth) |
+| Variable | `WIF_SERVICE_ACCOUNT` | Service account email the WIF provider impersonates |
+| Secret | `CLOUDFLARE_API_TOKEN` | API token with Workers deploy permission |
+| Secret | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account id |
+
+The Worker's `WMATA_KEY` secret lives in Cloudflare (set once via
+`wrangler secret put`) and persists across deploys — CI never touches it.
+Actions in the workflows are pinned to commit SHAs; bump the SHA and the
+version comment together when updating.
 
 ## Tech
 React 19 · TypeScript · Vite · Cloudflare Workers + Durable Objects · Firebase Hosting ·
