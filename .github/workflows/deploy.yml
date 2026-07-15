@@ -10,28 +10,52 @@ permissions:
   contents: read
   id-token: write
 
+# Actions are pinned to full commit SHAs (tag in the comment) so a moved or
+# compromised tag can't inject code into a workflow that holds deploy
+# credentials. Update by bumping the SHA alongside the version comment.
 jobs:
-  frontend:
-    name: Frontend → Firebase Hosting
+  check:
+    name: Typecheck + build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: |
+            frontend/package-lock.json
+            worker/package-lock.json
+
+      - run: npm --prefix frontend ci
+      - run: npm --prefix worker ci
+
+      - run: npm --prefix frontend run lint
+      - run: npm --prefix frontend run build
+      - run: npm --prefix worker run typecheck
+      - run: npm --prefix worker run test
+
+  frontend:
+    name: Frontend → Firebase Hosting
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
-      # Delete the lockfile + fresh npm install — workaround for npm bug #4828.
-      # The committed lockfile is generated on macOS/arm64; CI runs Ubuntu/x64.
-      # npm honors the lockfile's recorded optional deps and won't add the
-      # missing Linux platform binaries (Vite/rollup native, etc). Nuking the
-      # lockfile forces a fresh resolution that picks the right runner binaries.
-      - run: rm -f frontend/package-lock.json
-      - run: npm --prefix frontend install
+      # npm ci keeps the deploy reproducible against the committed lockfile.
+      # The lockfile is generated with npm >= 11, which records optional deps
+      # for every platform (the rolldown/vite native binaries for Linux x64
+      # included), so a macOS-generated lockfile installs cleanly here.
+      - run: npm --prefix frontend ci
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           workload_identity_provider: ${{ vars.WIF_PROVIDER }}
           service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
@@ -48,18 +72,19 @@ jobs:
 
   worker:
     name: Worker → Cloudflare
+    needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
 
       # wrangler-action installs wrangler and runs `wrangler deploy` in worker/.
       # The WMATA_KEY secret is already stored in Cloudflare and persists across
       # deploys, so it does not need to be set here.
-      - uses: cloudflare/wrangler-action@v3
+      - uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
