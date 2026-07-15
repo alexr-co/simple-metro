@@ -135,6 +135,17 @@ body {
 .mx-board { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .mx-plat-block { border-top: 1.5px solid var(--rule-strong); }
 
+/* Incoming board content fades in so a station switch reads as a transition
+   instead of a pop. Runs only when the element mounts (fresh station / tab /
+   alert box); the 10s data refresh reuses the same DOM, so no re-flash. */
+@keyframes mx-fadein {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.mx-plat-block, .mx-info, .mx-loading, .mx-noarrivals, .mx-alertbox {
+  animation: mx-fadein 140ms ease-out;
+}
+
 /* Scroll cue — a fade to paper with a bobbing chevron, hinting the board
    scrolls. Fades in only while content lies below the fold; pointer-events:none
    so it never intercepts a tap or scroll. */

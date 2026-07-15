@@ -537,6 +537,9 @@ export default function App() {
   const [times, setTimes] = useState<StationTimes | null>(null);
   const [elevator, setElevator] = useState<ElevatorOutage[]>([]);
   const [infoError, setInfoError] = useState(false);
+  // True once the current load has been in flight past the anti-flash delay
+  // (see the effect below the status derivation).
+  const [slowLoad, setSlowLoad] = useState(false);
 
   // Scroll cue: a bottom fade + chevron shown while the board still has content
   // below the fold, so a long arrivals/info list reads as scrollable. Hidden the
@@ -567,6 +570,7 @@ export default function App() {
     setTimes(null);
     setElevator([]);
     setInfoError(false);
+    setSlowLoad(false);
   }
 
   // Try to upgrade the fallback list with the authoritative one from the backend.
@@ -709,6 +713,19 @@ export default function App() {
     : failing           ? 'reconnecting'
     : 'live';
 
+  // Anti-flash: only surface "Loading arrivals…" if loading persists past
+  // 300ms. A normal station switch resolves in ~100–150ms, so the board goes
+  // straight from old rows to new rows without a loading-state blink; slow
+  // connections still get the indicator. slowLoad resets in the station-change
+  // adjustment above (it's latched, so it can go stale once status leaves
+  // 'loading' — the render condition re-checks status).
+  const loading = status === 'loading';
+  useEffect(() => {
+    if (!loading) return;
+    const t = setTimeout(() => setSlowLoad(true), 300);
+    return () => clearTimeout(t);
+  }, [loading]);
+
   // Keep the scroll cue in sync: recompute on content-height changes (tab/data/
   // status) and on viewport-height changes (resize / on-screen keyboard).
   useEffect(() => { recomputeCue(); },
@@ -798,7 +815,7 @@ export default function App() {
         <main className="mx-board" ref={boardRef} onScroll={recomputeCue}>
           {tab === 'arrivals' ? (
             <>
-              {status === 'loading' && (
+              {status === 'loading' && slowLoad && (
                 <div className="mx-loading">Loading arrivals…</div>
               )}
               {/* Too stale / never loaded: hide the arrivals (they'd be misleading)
