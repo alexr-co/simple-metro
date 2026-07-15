@@ -63,13 +63,34 @@ interface ElevatorOutage {
   returns: string | null;                               // ISO estimated return, if any
 }
 
+// ── per-code subset helpers ──────────────────────────────────────────────────
+// Shared by the DO (so filtering happens before the RPC response leaves it —
+// a few KB per request instead of the full ~85 KiB snapshot) and by the fetch
+// handlers' cold-DO fallback paths, which hold a full freshly-fetched list.
+function filterTrains(all: Train[], codes: string[]): Train[] {
+  const codeSet = new Set(codes);
+  return all.filter((t) => codeSet.has(t.loc));
+}
+function filterElevator(all: ElevatorOutage[], codes: string[]): ElevatorOutage[] {
+  const codeSet = new Set(codes);
+  return all.filter((e) => codeSet.has(e.station));
+}
+function subsetStationTimes(all: StationTimes, codes: string[]): StationTimes {
+  const subset: StationTimes = {};
+  for (const code of codes) if (all[code]) subset[code] = all[code];
+  return subset;
+}
+
 // ── Durable Object: the single source of truth for the cached snapshot. ─────
 // One global instance (named "global"), pinned to East-Coast North America
 // because users + WMATA's infrastructure both live there. Reads are strongly
 // consistent across every Cloudflare POP — no eventual consistency window.
+// The get methods take optional station codes and filter inside the DO, so a
+// typical request transfers only the caller's stations, not the whole system.
 export class WmataCache extends DurableObject<Env> {
-  async getPredictions(): Promise<Train[] | undefined> {
-    return this.ctx.storage.get<Train[]>('predictions:all');
+  async getPredictions(codes?: string[]): Promise<Train[] | undefined> {
+    const all = await this.ctx.storage.get<Train[]>('predictions:all');
+    return all && codes ? filterTrains(all, codes) : all;
   }
   async putPredictions(trains: Train[]): Promise<void> {
     await this.ctx.storage.put('predictions:all', trains);
@@ -86,14 +107,16 @@ export class WmataCache extends DurableObject<Env> {
   async putStations(stations: Station[]): Promise<void> {
     await this.ctx.storage.put('stations', stations);
   }
-  async getStationTimes(): Promise<StationTimes | undefined> {
-    return this.ctx.storage.get<StationTimes>('stationtimes');
+  async getStationTimes(codes?: string[]): Promise<StationTimes | undefined> {
+    const all = await this.ctx.storage.get<StationTimes>('stationtimes');
+    return all && codes ? subsetStationTimes(all, codes) : all;
   }
   async putStationTimes(times: StationTimes): Promise<void> {
     await this.ctx.storage.put('stationtimes', times);
   }
-  async getElevator(): Promise<ElevatorOutage[] | undefined> {
-    return this.ctx.storage.get<ElevatorOutage[]>('elevator');
+  async getElevator(codes?: string[]): Promise<ElevatorOutage[] | undefined> {
+    const all = await this.ctx.storage.get<ElevatorOutage[]>('elevator');
+    return all && codes ? filterElevator(all, codes) : all;
   }
   async putElevator(outages: ElevatorOutage[]): Promise<void> {
     await this.ctx.storage.put('elevator', outages);
@@ -291,9 +314,12 @@ function readTag(c: Cursor): { field: number; wire: number } {
   const key = readVarint(c);
   return { field: Math.floor(key / 8), wire: key & 7 };
 }
+// One shared decoder: readString runs for every string field in the feed
+// (thousands per parse), so per-call construction is measurable churn.
+const UTF8 = new TextDecoder();
 function readString(c: Cursor): string {
   const len = readVarint(c);
-  const s = new TextDecoder().decode(c.buf.subarray(c.pos, c.pos + len));
+  const s = UTF8.decode(c.buf.subarray(c.pos, c.pos + len));
   c.pos += len;
   return s;
 }
@@ -693,16 +719,17 @@ async function refreshPredictions(env: Env): Promise<Train[]> {
   const c = cache(env);
 
   // codeToName maps a destination station code → canonical name (for the
-  // GTFS-RT dest column). fuzzyIndex is only needed for the GetPrediction
-  // fallback. If stations is cold, refresh it once on the way through.
+  // GTFS-RT dest column). If stations is cold, refresh it once on the way
+  // through. The fuzzy index is only needed on the GetPrediction fallback
+  // path, so it's built there (in the catch), not on every refresh.
   const codeToName = new Map<string, string>();
-  let fuzzyIndex: StationFuzzy[] = [];
+  let stationsForFuzzy: Station[] = [];
   try {
     const cached = await c.getStations();
     const stations = applyNameOverrides(
       (cached && cached.length > 0) ? cached : await refreshStations(env));
     for (const s of stations) for (const code of s.codes) codeToName.set(code, s.name);
-    fuzzyIndex = buildFuzzyIndex(stations);
+    stationsForFuzzy = stations;
   } catch (e) {
     console.warn('stations unavailable for prediction enrichment; keeping raw dest', e);
   }
@@ -725,7 +752,8 @@ async function refreshPredictions(env: Env): Promise<Train[]> {
     trains = tripsToTrains(trips, Date.now() / 1000, codeToName, carsByTrip);
   } catch (e) {
     console.warn('gtfs-rt tripupdates failed; falling back to GetPrediction', e);
-    trains = enrichPredictions(await fetchAllPredictions(env), codeToName, fuzzyIndex);
+    trains = enrichPredictions(
+      await fetchAllPredictions(env), codeToName, buildFuzzyIndex(stationsForFuzzy));
   }
 
   await c.putPredictions(trains);
@@ -740,6 +768,21 @@ async function refreshStations(env: Env): Promise<Station[]> {
   const stations = await fetchStations(env);
   await cache(env).putStations(stations);
   return stations;
+}
+
+// ── cold-DO refresh dedupe ──────────────────────────────────────────────────
+// The fetch handlers fall back to a direct WMATA fetch when the DO is empty
+// (first deploy, migration). Without a guard, a burst of concurrent requests
+// in that window would each hit WMATA. Deduping per isolate collapses the
+// burst at each POP to one upstream call per kind; the 5s edge cache and the
+// cron pre-warm (which repopulates the DO within a minute) cover the rest.
+const inflightRefresh = new Map<string, Promise<unknown>>();
+function dedupeRefresh<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const existing = inflightRefresh.get(key) as Promise<T> | undefined;
+  if (existing) return existing;
+  const p = fn().finally(() => inflightRefresh.delete(key));
+  inflightRefresh.set(key, p);
+  return p;
 }
 
 // ── request validation ──────────────────────────────────────────────────────
@@ -841,13 +884,14 @@ export default {
         // Self-heal a snapshot left over from before address/coords were added,
         // instead of waiting for the daily refresh (the DO persists across deploys).
         if (!cached || cached.length === 0 || !cached.some((s) => s.address)) {
-          cached = await refreshStations(env);
+          cached = await dedupeRefresh('stations', () => refreshStations(env));
         }
         return json(applyNameOverrides(cached), { cacheControl: CC_STATIONS });
       }
 
       if (path === 'incidents' || path === 'incidents/') {
-        const incidents = (await c.getIncidents()) ?? (await refreshIncidents(env));
+        const incidents = (await c.getIncidents())
+          ?? (await dedupeRefresh('incidents', () => refreshIncidents(env)));
         return json(incidents, { cacheControl: CC_INCIDENTS });
       }
 
@@ -855,9 +899,10 @@ export default {
       if (predMatch) {
         const codes = parseCodes(predMatch[1]);
         if (!codes) return json({ error: 'invalid_codes' }, { status: 400 });
-        const all = (await c.getPredictions()) ?? (await refreshPredictions(env));
-        const codeSet = new Set(codes);
-        const subset = all.filter((t) => codeSet.has(t.loc));
+        // Filtering happens inside the DO; only the cold-DO fallback (which
+        // holds the full freshly-fetched list) filters here.
+        const subset = (await c.getPredictions(codes))
+          ?? filterTrains(await dedupeRefresh('predictions', () => refreshPredictions(env)), codes);
         return json(subset, { cacheControl: CC_PREDICTIONS });
       }
 
@@ -865,9 +910,9 @@ export default {
       if (timesMatch) {
         const codes = parseCodes(timesMatch[1]);
         if (!codes) return json({ error: 'invalid_codes' }, { status: 400 });
-        const all = (await c.getStationTimes()) ?? (await refreshStationTimes(env));
-        const subset: StationTimes = {};
-        for (const code of codes) if (all[code]) subset[code] = all[code];
+        const subset = (await c.getStationTimes(codes))
+          ?? subsetStationTimes(
+            await dedupeRefresh('station-times', () => refreshStationTimes(env)), codes);
         return json(subset, { cacheControl: CC_STATIONS });
       }
 
@@ -875,9 +920,8 @@ export default {
       if (elevMatch) {
         const codes = parseCodes(elevMatch[1]);
         if (!codes) return json({ error: 'invalid_codes' }, { status: 400 });
-        const all = (await c.getElevator()) ?? (await refreshElevator(env));
-        const codeSet = new Set(codes);
-        const subset = all.filter((e) => codeSet.has(e.station));
+        const subset = (await c.getElevator(codes))
+          ?? filterElevator(await dedupeRefresh('elevator', () => refreshElevator(env)), codes);
         return json(subset, { cacheControl: CC_INCIDENTS });
       }
 
@@ -893,3 +937,11 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
+// Exported for unit tests (worker/test); not part of the Worker's public API.
+export {
+  parseCodes, subPath, stationCode,
+  parseTripUpdateFeed, parseVehiclePositionFeed, tripsToTrains,
+  fuzzyMatch, buildFuzzyIndex, adaptStations,
+};
+export type { Station, Train, GtfsTrip };
