@@ -26,8 +26,20 @@ export function getStations(signal?: AbortSignal): Promise<Station[]> {
   return getJson<Station[]>('stations', signal);
 }
 
-export function getPredictions(codes: string[], signal?: AbortSignal): Promise<Train[]> {
-  return getJson<Train[]>(`predictions/${codes.join(',')}`, signal);
+// generatedAt (X-Data-Timestamp, epoch ms) is when the proxy built the
+// snapshot the rows came from — their `min` values are baked in at that
+// moment, so it's the honest "updated" time. Null if the proxy didn't send it.
+export interface PredictionsResult { trains: Train[]; generatedAt: number | null }
+
+export async function getPredictions(
+  codes: string[], signal?: AbortSignal,
+): Promise<PredictionsResult> {
+  const path = `predictions/${codes.join(',')}`;
+  const r = await fetch(`${BASE}/${path}`, { signal, headers: { Accept: 'application/json' } });
+  if (!r.ok) throw new Error(`HTTP ${r.status} for ${path}`);
+  const trains = (await r.json()) as Train[];
+  const ts = Number(r.headers.get('X-Data-Timestamp'));
+  return { trains, generatedAt: Number.isFinite(ts) && ts > 0 ? ts : null };
 }
 
 export function getIncidents(signal?: AbortSignal): Promise<Incident[]> {

@@ -1,13 +1,17 @@
 /* WMATA proxy on Cloudflare Workers.
  *
- * scheduled() — pre-warms the WmataCache Durable Object from WMATA on three
- *   cron schedules: predictions (every 20s via in-handler fan-out), incidents
- *   (every 5 min), stations (daily). Predictions come from WMATA's GTFS-Realtime
- *   TripUpdates feed — the same engine wmata.com uses — which gives real
- *   predicted arrival times for every upcoming train at every platform (not just
- *   the nearest ~3 like the legacy GetPrediction endpoint). GetPrediction is kept
- *   only as a fallback if the GTFS-RT feed is unavailable. One WMATA call of each
- *   kind serves every station, so upstream load is constant regardless of users.
+ * scheduled() — pre-warms the WmataCache Durable Object on three cron
+ *   schedules: predictions (every 20s via in-handler fan-out), incidents
+ *   (every 5 min), stations (daily). The fetch-and-parse work runs *inside*
+ *   the DO (RPC'd from here) — DO invocations get a 30s CPU budget on every
+ *   plan, while a free-plan cron invocation gets 10ms, which parsing the
+ *   GTFS-RT protobuf feeds blows through. Predictions come from WMATA's
+ *   GTFS-Realtime TripUpdates feed — the same engine wmata.com uses — which
+ *   gives real predicted arrival times for every upcoming train at every
+ *   platform (not just the nearest ~3 like the legacy GetPrediction endpoint).
+ *   GetPrediction is kept only as a fallback if the GTFS-RT feed is
+ *   unavailable. One WMATA call of each kind serves every station, so upstream
+ *   load is constant regardless of users.
  *
  * fetch() — serves /api/wmata/{stations,incidents,predictions/:codes} by
  *   reading from the DO (strongly consistent globally — no per-POP 60s
@@ -44,6 +48,10 @@ interface Train {
   group: string;
   loc: string;
 }
+// Prediction rows plus the epoch-ms time the snapshot was built. `min` values
+// are baked in at build time, so clients need `ts` (surfaced as the
+// X-Data-Timestamp header) to tell "fetched just now" from "generated just now".
+interface PredictionsSnapshot { trains: Train[]; ts: number }
 interface Incident { lines: LineCode[]; type: string; text: string }
 
 // Info-tab data. Both are near-static and cached in the DO (station times daily,
@@ -64,9 +72,9 @@ interface ElevatorOutage {
 }
 
 // ── per-code subset helpers ──────────────────────────────────────────────────
-// Shared by the DO (so filtering happens before the RPC response leaves it —
-// a few KB per request instead of the full ~85 KiB snapshot) and by the fetch
-// handlers' cold-DO fallback paths, which hold a full freshly-fetched list.
+// Used inside the DO's get and refresh methods, so filtering happens before
+// the RPC response leaves it — a few KB per request instead of the full
+// ~85 KiB snapshot.
 function filterTrains(all: Train[], codes: string[]): Train[] {
   const codeSet = new Set(codes);
   return all.filter((t) => codeSet.has(t.loc));
@@ -87,39 +95,112 @@ function subsetStationTimes(all: StationTimes, codes: string[]): StationTimes {
 // consistent across every Cloudflare POP — no eventual consistency window.
 // The get methods take optional station codes and filter inside the DO, so a
 // typical request transfers only the caller's stations, not the whole system.
+//
+// The refresh methods live here too, not in the Worker: fetching and parsing
+// the WMATA feeds is the CPU-heavy part of the pipeline (two protobuf feeds
+// per predictions refresh), and DO invocations get a 30s CPU budget on every
+// plan, while a free-plan cron invocation gets 10ms — enough to await these
+// RPCs, not to do the parsing itself.
 export class WmataCache extends DurableObject<Env> {
-  async getPredictions(codes?: string[]): Promise<Train[] | undefined> {
-    const all = await this.ctx.storage.get<Train[]>('predictions:all');
-    return all && codes ? filterTrains(all, codes) : all;
-  }
-  async putPredictions(trains: Train[]): Promise<void> {
-    await this.ctx.storage.put('predictions:all', trains);
+  async getPredictions(codes?: string[]): Promise<PredictionsSnapshot | undefined> {
+    const stored = await this.ctx.storage.get(['predictions:all', 'predictions:ts']);
+    const all = stored.get('predictions:all') as Train[] | undefined;
+    if (!all) return undefined;
+    return {
+      trains: codes ? filterTrains(all, codes) : all,
+      // 0 for a snapshot written before ts existed; the handler omits the
+      // header then, and the next refresh stamps it.
+      ts: (stored.get('predictions:ts') as number | undefined) ?? 0,
+    };
   }
   async getIncidents(): Promise<Incident[] | undefined> {
     return this.ctx.storage.get<Incident[]>('incidents');
   }
-  async putIncidents(incidents: Incident[]): Promise<void> {
-    await this.ctx.storage.put('incidents', incidents);
-  }
   async getStations(): Promise<Station[] | undefined> {
     return this.ctx.storage.get<Station[]>('stations');
-  }
-  async putStations(stations: Station[]): Promise<void> {
-    await this.ctx.storage.put('stations', stations);
   }
   async getStationTimes(codes?: string[]): Promise<StationTimes | undefined> {
     const all = await this.ctx.storage.get<StationTimes>('stationtimes');
     return all && codes ? subsetStationTimes(all, codes) : all;
   }
-  async putStationTimes(times: StationTimes): Promise<void> {
-    await this.ctx.storage.put('stationtimes', times);
-  }
   async getElevator(codes?: string[]): Promise<ElevatorOutage[] | undefined> {
     const all = await this.ctx.storage.get<ElevatorOutage[]>('elevator');
     return all && codes ? filterElevator(all, codes) : all;
   }
-  async putElevator(outages: ElevatorOutage[]): Promise<void> {
+
+  // Fetch GTFS-RT (fallback: legacy GetPrediction), store the snapshot plus
+  // its generation timestamp. Returns the subset for `codes` so the cold-DO
+  // fetch path gets its data in one round trip; cron callers pass no codes and
+  // get an empty array — they only care that the snapshot landed, and the full
+  // ~85 KiB list shouldn't ride back on every 20s refresh RPC.
+  async refreshPredictions(codes?: string[]): Promise<Train[]> {
+    // codeToName maps a destination station code → canonical name (for the
+    // GTFS-RT dest column). If stations is cold, refresh it once on the way
+    // through. The fuzzy index is only needed on the GetPrediction fallback
+    // path, so it's built there (in the catch), not on every refresh.
+    const codeToName = new Map<string, string>();
+    let stationsForFuzzy: Station[] = [];
+    try {
+      const cached = await this.ctx.storage.get<Station[]>('stations');
+      const stations = applyNameOverrides(
+        (cached && cached.length > 0) ? cached : await this.refreshStations());
+      for (const s of stations) for (const code of s.codes) codeToName.set(code, s.name);
+      stationsForFuzzy = stations;
+    } catch (e) {
+      console.warn('stations unavailable for prediction enrichment; keeping raw dest', e);
+    }
+
+    // Primary: GTFS-RT TripUpdates (real predictions, full horizon, all
+    // trains). Fallback: legacy GetPrediction (nearest ~3 per platform) so the
+    // board never goes blank if the protobuf feed hiccups.
+    let trains: Train[];
+    try {
+      // Car counts (VehiclePositions) are a best-effort side channel: if that
+      // feed fails we still serve predictions, just without the "N car" line.
+      const [trips, carsByTrip] = await Promise.all([
+        fetchTripUpdates(this.env),
+        fetchVehicleCars(this.env).catch((e) => {
+          console.warn('vehiclepositions failed; serving without car counts', e);
+          return new Map<string, number>();
+        }),
+      ]);
+      if (trips.length === 0) throw new Error('empty tripupdates feed');
+      trains = tripsToTrains(trips, Date.now() / 1000, codeToName, carsByTrip);
+    } catch (e) {
+      console.warn('gtfs-rt tripupdates failed; falling back to GetPrediction', e);
+      trains = enrichPredictions(
+        await fetchAllPredictions(this.env), codeToName, buildFuzzyIndex(stationsForFuzzy));
+    }
+
+    await this.ctx.storage.put({ 'predictions:all': trains, 'predictions:ts': Date.now() });
+    return codes ? filterTrains(trains, codes) : [];
+  }
+  async refreshIncidents(): Promise<Incident[]> {
+    const incidents = await fetchIncidents(this.env);
+    await this.ctx.storage.put('incidents', incidents);
+    return incidents;
+  }
+  async refreshStations(): Promise<Station[]> {
+    const stations = await fetchStations(this.env);
+    await this.ctx.storage.put('stations', stations);
+    return stations;
+  }
+  async refreshStationTimes(codes?: string[]): Promise<StationTimes> {
+    // Destination codes resolve against the station list; refresh it first if
+    // this DO has never seen one.
+    const cached = await this.ctx.storage.get<Station[]>('stations');
+    const stations = applyNameOverrides(
+      (cached && cached.length > 0) ? cached : await this.refreshStations());
+    const codeToName = new Map<string, string>();
+    for (const s of stations) for (const code of s.codes) codeToName.set(code, s.name);
+    const times = await fetchStationTimes(this.env, codeToName);
+    await this.ctx.storage.put('stationtimes', times);
+    return codes ? subsetStationTimes(times, codes) : times;
+  }
+  async refreshElevator(codes?: string[]): Promise<ElevatorOutage[]> {
+    const outages = await fetchElevator(this.env);
     await this.ctx.storage.put('elevator', outages);
+    return codes ? filterElevator(outages, codes) : outages;
   }
 }
 
@@ -671,21 +752,6 @@ async function fetchStationTimes(env: Env, codeToName: Map<string, string>): Pro
     'Rail.svc/json/jStationTimes', env.WMATA_KEY);
   return adaptStationTimes(data.StationTimes ?? [], codeToName);
 }
-async function refreshElevator(env: Env): Promise<ElevatorOutage[]> {
-  const outages = await fetchElevator(env);
-  await cache(env).putElevator(outages);
-  return outages;
-}
-async function refreshStationTimes(env: Env): Promise<StationTimes> {
-  const c = cache(env);
-  const stations = applyNameOverrides((await c.getStations()) ?? (await refreshStations(env)));
-  const codeToName = new Map<string, string>();
-  for (const s of stations) for (const code of s.codes) codeToName.set(code, s.name);
-  const times = await fetchStationTimes(env, codeToName);
-  await c.putStationTimes(times);
-  return times;
-}
-
 // Resolve GetPrediction's raw/abbreviated destinations to canonical station
 // names. Only used on the fallback path — the GTFS-RT path resolves dest
 // straight from the destination station code.
@@ -715,67 +781,13 @@ function enrichPredictions(
   });
 }
 
-async function refreshPredictions(env: Env): Promise<Train[]> {
-  const c = cache(env);
-
-  // codeToName maps a destination station code → canonical name (for the
-  // GTFS-RT dest column). If stations is cold, refresh it once on the way
-  // through. The fuzzy index is only needed on the GetPrediction fallback
-  // path, so it's built there (in the catch), not on every refresh.
-  const codeToName = new Map<string, string>();
-  let stationsForFuzzy: Station[] = [];
-  try {
-    const cached = await c.getStations();
-    const stations = applyNameOverrides(
-      (cached && cached.length > 0) ? cached : await refreshStations(env));
-    for (const s of stations) for (const code of s.codes) codeToName.set(code, s.name);
-    stationsForFuzzy = stations;
-  } catch (e) {
-    console.warn('stations unavailable for prediction enrichment; keeping raw dest', e);
-  }
-
-  // Primary: GTFS-RT TripUpdates (real predictions, full horizon, all trains).
-  // Fallback: legacy GetPrediction (nearest ~3 per platform) so the board never
-  // goes blank if the protobuf feed hiccups.
-  let trains: Train[];
-  try {
-    // Car counts (VehiclePositions) are a best-effort side channel: if that feed
-    // fails we still serve predictions, just without the "N car" line.
-    const [trips, carsByTrip] = await Promise.all([
-      fetchTripUpdates(env),
-      fetchVehicleCars(env).catch((e) => {
-        console.warn('vehiclepositions failed; serving without car counts', e);
-        return new Map<string, number>();
-      }),
-    ]);
-    if (trips.length === 0) throw new Error('empty tripupdates feed');
-    trains = tripsToTrains(trips, Date.now() / 1000, codeToName, carsByTrip);
-  } catch (e) {
-    console.warn('gtfs-rt tripupdates failed; falling back to GetPrediction', e);
-    trains = enrichPredictions(
-      await fetchAllPredictions(env), codeToName, buildFuzzyIndex(stationsForFuzzy));
-  }
-
-  await c.putPredictions(trains);
-  return trains;
-}
-async function refreshIncidents(env: Env): Promise<Incident[]> {
-  const incidents = await fetchIncidents(env);
-  await cache(env).putIncidents(incidents);
-  return incidents;
-}
-async function refreshStations(env: Env): Promise<Station[]> {
-  const stations = await fetchStations(env);
-  await cache(env).putStations(stations);
-  return stations;
-}
-
 // ── cold-DO refresh dedupe ──────────────────────────────────────────────────
-// The fetch handlers fall back to a direct WMATA fetch when the DO is empty
+// The fetch handlers fall back to a DO refresh RPC when the DO is empty
 // (first deploy, migration). Without a guard, a burst of concurrent requests
-// in that window would each hit WMATA. Deduping per isolate collapses the
-// burst at each POP to one upstream call per kind; the 5s edge cache and the
-// cron pre-warm (which repopulates the DO within a minute) cover the rest.
+// in that window would each trigger a WMATA fetch inside the DO. Deduping per
+// isolate collapses the burst at each POP to one refresh per kind; the 5s edge
+// cache and the cron pre-warm (which repopulates the DO within a minute) cover
+// the rest.
 const inflightRefresh = new Map<string, Promise<unknown>>();
 function dedupeRefresh<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const existing = inflightRefresh.get(key) as Promise<T> | undefined;
@@ -796,6 +808,7 @@ function parseCodes(seg: string): string[] | null {
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+  'Access-Control-Expose-Headers': 'X-Data-Timestamp',
   'Access-Control-Max-Age': '86400',
 };
 
@@ -828,26 +841,31 @@ function subPath(rawPath: string): string {
 // ── handlers ────────────────────────────────────────────────────────────────
 export default {
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Each cron pattern owns one refresh routine. waitUntil keeps the isolate
-    // alive past the scheduled() return so the DO write actually completes.
+    // Each cron pattern owns one refresh routine, RPC'd into the DO so the
+    // fetch+parse CPU is billed to the DO's 30s budget — a free-plan cron
+    // invocation gets 10ms, which is enough to await RPCs but not to parse
+    // GTFS-RT feeds (doing that here is what silently killed refreshes).
+    // waitUntil keeps the invocation alive past the scheduled() return.
     switch (controller.cron) {
       case '* * * * *': {
         // Cloudflare cron's minimum granularity is 1 min; for 20s polling we
-        // fan out 3 fetches inside one minute via setTimeout. Total wallclock
-        // ~40-46s (each fetch ~2s), leaving headroom before the next tick.
+        // fan out 3 refreshes inside one minute via setTimeout. Total
+        // wallclock ~40-46s (each refresh ~2s), leaving headroom before the
+        // next tick. A fresh stub per call sidesteps stale-stub errors across
+        // the 20s gaps.
         const fanOut = async (): Promise<void> => {
-          await refreshPredictions(env);
+          await cache(env).refreshPredictions();
           await new Promise((r) => setTimeout(r, 20_000));
-          await refreshPredictions(env);
+          await cache(env).refreshPredictions();
           await new Promise((r) => setTimeout(r, 20_000));
-          await refreshPredictions(env);
+          await cache(env).refreshPredictions();
         };
         ctx.waitUntil(fanOut().catch((e) => console.error('predictions refresh failed', e)));
         return;
       }
       case '*/5 * * * *':
         ctx.waitUntil(
-          Promise.all([refreshIncidents(env), refreshElevator(env)])
+          Promise.all([cache(env).refreshIncidents(), cache(env).refreshElevator()])
             .then(() => undefined)
             .catch((e) => console.error('incidents/elevator refresh failed', e)));
         return;
@@ -855,8 +873,8 @@ export default {
         // Sequential: station times resolves destination codes against the
         // freshly-refreshed station list.
         ctx.waitUntil(
-          refreshStations(env)
-            .then(() => refreshStationTimes(env))
+          cache(env).refreshStations()
+            .then(() => cache(env).refreshStationTimes())
             .then(() => undefined)
             .catch((e) => console.error('daily refresh failed', e)));
         return;
@@ -884,14 +902,14 @@ export default {
         // Self-heal a snapshot left over from before address/coords were added,
         // instead of waiting for the daily refresh (the DO persists across deploys).
         if (!cached || cached.length === 0 || !cached.some((s) => s.address)) {
-          cached = await dedupeRefresh('stations', () => refreshStations(env));
+          cached = await dedupeRefresh('stations', () => c.refreshStations());
         }
         return json(applyNameOverrides(cached), { cacheControl: CC_STATIONS });
       }
 
       if (path === 'incidents' || path === 'incidents/') {
         const incidents = (await c.getIncidents())
-          ?? (await dedupeRefresh('incidents', () => refreshIncidents(env)));
+          ?? (await dedupeRefresh('incidents', () => c.refreshIncidents()));
         return json(incidents, { cacheControl: CC_INCIDENTS });
       }
 
@@ -899,11 +917,19 @@ export default {
       if (predMatch) {
         const codes = parseCodes(predMatch[1]);
         if (!codes) return json({ error: 'invalid_codes' }, { status: 400 });
-        // Filtering happens inside the DO; only the cold-DO fallback (which
-        // holds the full freshly-fetched list) filters here.
-        const subset = (await c.getPredictions(codes))
-          ?? filterTrains(await dedupeRefresh('predictions', () => refreshPredictions(env)), codes);
-        return json(subset, { cacheControl: CC_PREDICTIONS });
+        // Filtering happens inside the DO; the cold-DO fallback asks the
+        // refresh for the same subset.
+        const snap = (await c.getPredictions(codes))
+          ?? {
+            trains: await dedupeRefresh('predictions', () => c.refreshPredictions(codes)),
+            ts: Date.now(),
+          };
+        return json(snap.trains, {
+          cacheControl: CC_PREDICTIONS,
+          // When the snapshot was built (its `min` values are baked in then) —
+          // lets clients distinguish "fetched just now" from "fresh data".
+          headers: snap.ts > 0 ? { 'X-Data-Timestamp': String(snap.ts) } : {},
+        });
       }
 
       const timesMatch = /^station-times\/([^/]+)\/?$/.exec(path);
@@ -911,8 +937,7 @@ export default {
         const codes = parseCodes(timesMatch[1]);
         if (!codes) return json({ error: 'invalid_codes' }, { status: 400 });
         const subset = (await c.getStationTimes(codes))
-          ?? subsetStationTimes(
-            await dedupeRefresh('station-times', () => refreshStationTimes(env)), codes);
+          ?? (await dedupeRefresh('station-times', () => c.refreshStationTimes(codes)));
         return json(subset, { cacheControl: CC_STATIONS });
       }
 
@@ -921,7 +946,7 @@ export default {
         const codes = parseCodes(elevMatch[1]);
         if (!codes) return json({ error: 'invalid_codes' }, { status: 400 });
         const subset = (await c.getElevator(codes))
-          ?? filterElevator(await dedupeRefresh('elevator', () => refreshElevator(env)), codes);
+          ?? (await dedupeRefresh('elevator', () => c.refreshElevator(codes)));
         return json(subset, { cacheControl: CC_INCIDENTS });
       }
 

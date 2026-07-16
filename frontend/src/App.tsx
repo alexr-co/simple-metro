@@ -586,14 +586,17 @@ export default function App() {
     if (!station) return;
     const id = ++reqId.current;
     try {
-      const [tr, inc] = await Promise.all([
+      const [pred, inc] = await Promise.all([
         api.getPredictions(station.codes),
         api.getIncidents().catch(() => [] as Incident[]),
       ]);
       if (id !== reqId.current) return;
-      setTrains(tr);
+      setTrains(pred.trains);
       setIncidents(inc.filter((i) => i.lines.some((l) => station.lines.includes(l))));
-      setUpdatedAt(Date.now());
+      // Prefer the server's snapshot-built time: "updated Xs ago" then reflects
+      // the age of the data, not of the fetch — a proxy stuck re-serving an old
+      // snapshot ages visibly instead of masquerading as live.
+      setUpdatedAt(pred.generatedAt ?? Date.now());
       setFailing(false);
     } catch {
       // Keep the last-good trains/incidents on screen; just flag the failure.
