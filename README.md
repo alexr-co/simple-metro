@@ -17,19 +17,25 @@ Two deployables behind a single domain, joined at Cloudflare's edge:
 
 - **Frontend** (`frontend/`) — React 19 + TypeScript + Vite SPA, deployed to
   **Firebase Hosting**.
-- **API proxy** (`worker/`) — a **Cloudflare Worker** (TypeScript) that fetches from
-  WMATA and serves a small, normalized JSON API. A **Durable Object** (`WmataCache`,
-  pinned to the US East coast) holds a single globally strongly-consistent snapshot,
-  pre-warmed by cron triggers: predictions (~every 20s via in-handler fan-out), incidents
-  and elevator/escalator status (every 5 min), and the station list plus first/last-train
-  schedules (daily). One upstream fetch serves every user, so WMATA load stays small and
-  constant (~9,000 calls/day, well under WMATA's 50k/day limit) regardless of traffic.
+- **API proxy** (`worker/`) — a **Cloudflare Worker** (TypeScript) that serves a small,
+  normalized JSON API. A **Durable Object** (`WmataCache`, pinned to the US East coast)
+  holds a single globally strongly-consistent snapshot and does the fetching and parsing
+  itself, pre-warmed by cron triggers that RPC into it: predictions (~every 20s via
+  in-handler fan-out), incidents and elevator/escalator status (every 5 min), and the
+  station list plus first/last-train schedules (daily). The refresh work lives inside the
+  DO deliberately: DO invocations get a 30s CPU budget on every plan, while a free-plan
+  cron invocation gets 10ms — enough to await RPCs, not to parse protobuf feeds. One
+  upstream fetch serves every user, so WMATA load stays small and constant (~9,000
+  calls/day, well under WMATA's 50k/day limit) regardless of traffic.
 - **Edge routing** — Cloudflare intercepts `metro.alexr-co.com/api/*` and dispatches to
   the Worker; all other paths fall through to the Firebase-hosted SPA.
 
 Endpoints: `/api/wmata/stations`, `/api/wmata/incidents`,
 `/api/wmata/predictions/:codes`, `/api/wmata/station-times/:codes`,
-`/api/wmata/elevator/:codes`.
+`/api/wmata/elevator/:codes`. Predictions responses carry an
+`X-Data-Timestamp` header — the epoch-ms time the snapshot was built (its
+minutes-to-arrival values are baked in then), which the frontend uses for its
+"updated Xs ago" label and staleness cutoff instead of trusting fetch time.
 
 ### Data sources
 Predictions come from WMATA's **GTFS-Realtime** feeds — a public, binary (protobuf)
@@ -42,11 +48,11 @@ reports the nearest ~3 trains per platform:
 - **VehiclePositions** (`rail-gtfsrt-vehiclepositions.pb`) — supplies each train's car
   count (6 or 8), joined onto its predictions by `trip_id`.
 
-The Worker decodes both feeds with a small, **dependency-free protobuf reader** in
-`worker/src/index.ts` that reads only the handful of fields we need — no `.proto` schema
-compiler and no `protobufjs` dependency. If the GTFS-RT feed is ever unavailable, the
-Worker falls back to WMATA's legacy `GetPrediction` JSON endpoint (nearest ~3 trains) so
-the board never goes blank.
+Both feeds are decoded inside the Durable Object with a small, **dependency-free
+protobuf reader** in `worker/src/index.ts` that reads only the handful of fields we
+need — no `.proto` schema compiler and no `protobufjs` dependency. If the GTFS-RT feed
+is ever unavailable, the refresh falls back to WMATA's legacy `GetPrediction` JSON
+endpoint (nearest ~3 trains) so the board never goes blank.
 
 The **Info tab** draws on the classic JSON endpoints, cached in the same Durable Object:
 station address and coordinates come free from the daily `jStations` fetch; first/last
