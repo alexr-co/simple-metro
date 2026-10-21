@@ -1,11 +1,13 @@
 /* WMATA proxy on Cloudflare Workers.
  *
- * scheduled() — pre-warms the WmataCache Durable Object on three cron
- *   schedules: predictions (every 20s via in-handler fan-out), incidents
- *   (every 5 min), stations (daily). The fetch-and-parse work runs *inside*
- *   the DO (RPC'd from here) — DO invocations get a 30s CPU budget on every
- *   plan, while a free-plan cron invocation gets 10ms, which parsing the
- *   GTFS-RT protobuf feeds blows through. Predictions come from WMATA's
+ * Predictions refresh every 5s on a self-rescheduling alarm inside the
+ *   WmataCache Durable Object — cron's 1-minute granularity can't go faster.
+ *   scheduled() runs three crons: a once-a-minute watchdog that re-arms that
+ *   alarm if it ever lapses, incidents/elevators (every 5 min), and stations
+ *   (daily). The fetch-and-parse work runs *inside* the DO (RPC'd from
+ *   here) — DO invocations get a 30s CPU budget on every plan, while a
+ *   free-plan cron invocation gets 10ms, which parsing the GTFS-RT protobuf
+ *   feeds blows through. Predictions come from WMATA's
  *   GTFS-Realtime TripUpdates feed — the same engine wmata.com uses — which
  *   gives real predicted arrival times for every upcoming train at every
  *   platform (not just the nearest ~3 like the legacy GetPrediction endpoint).
@@ -13,10 +15,12 @@
  *   unavailable. One WMATA call of each kind serves every station, so upstream
  *   load is constant regardless of users.
  *
- * fetch() — serves /api/wmata/{stations,incidents,predictions/:codes} by
+ * fetch() — serves /api/wmata/{board,stations,incidents,predictions}/… by
  *   reading from the DO (strongly consistent globally — no per-POP 60s
  *   propagation lag like KV had). Predictions are filtered per request to
- *   the codes the caller asked for. If the DO is empty (just after first
+ *   the codes the caller asked for. /board/:codes is what the frontend polls:
+ *   predictions + incidents in one request, plus when the next snapshot is
+ *   due so clients can poll in step with the refresh loop. If the DO is empty (just after first
  *   deploy), each route falls back to a direct WMATA fetch so users never
  *   see no data.
  */
@@ -51,8 +55,29 @@ interface Train {
 // Prediction rows plus the epoch-ms time the snapshot was built. `min` values
 // are baked in at build time, so clients need `ts` (surfaced as the
 // X-Data-Timestamp header) to tell "fetched just now" from "generated just now".
-interface PredictionsSnapshot { trains: Train[]; ts: number }
+// `nextTs` is when the following snapshot should land, so clients can time
+// their next poll to just after it instead of polling on a blind interval.
+interface PredictionsSnapshot { trains: Train[]; ts: number; nextTs: number }
 interface Incident { lines: LineCode[]; type: string; text: string }
+// Everything the arrivals board needs in one round trip. `nextInMs` is
+// relative (computed in the DO at read time) so client clock skew can't
+// throw off poll timing.
+interface Board { trains: Train[]; incidents: Incident[]; ts: number; nextInMs: number }
+
+// ── predictions refresh loop ────────────────────────────────────────────────
+// WMATA regenerates its rail GTFS-RT feeds about every 5s (measured Oct 2026:
+// median gap 5s for both TripUpdates and VehiclePositions), so pulling faster
+// gains nothing. Beats land on wall-clock multiples of the interval, so the
+// schedule is stateless — it survives the DO being evicted between alarms —
+// and can't drift.
+const REFRESH_INTERVAL_MS = 5_000;
+function nextBeat(now: number): number {
+  return (Math.floor(now / REFRESH_INTERVAL_MS) + 1) * REFRESH_INTERVAL_MS;
+}
+// A snapshot (or pending alarm) this far behind means the loop has stalled —
+// or never started, e.g. under `wrangler dev`, where crons don't fire. Reads
+// re-arm it, alongside the once-a-minute cron watchdog.
+const LOOP_STALL_MS = 3 * REFRESH_INTERVAL_MS;
 
 // Info-tab data. Both are near-static and cached in the DO (station times daily,
 // elevator/escalator outages every 5 min alongside incidents).
@@ -102,15 +127,58 @@ function subsetStationTimes(all: StationTimes, codes: string[]): StationTimes {
 // plan, while a free-plan cron invocation gets 10ms — enough to await these
 // RPCs, not to do the parsing itself.
 export class WmataCache extends DurableObject<Env> {
+  // In-flight predictions refresh, so an alarm and a cold-read refresh that
+  // overlap share one WMATA fetch instead of racing two.
+  private inflight?: Promise<PredictionsSnapshot>;
+
+  // The refresh loop: each alarm re-arms the next beat *before* refreshing,
+  // so a failed or slow refresh can't break the chain. Errors are caught
+  // rather than thrown — a throw would trigger the runtime's backoff retries,
+  // which would knock the loop off its beat.
+  async alarm(): Promise<void> {
+    await this.ctx.storage.setAlarm(nextBeat(Date.now()));
+    try {
+      await this.refreshSnapshot();
+    } catch (e) {
+      console.error('predictions refresh failed', e);
+    }
+  }
+
+  // Arms the alarm loop unless it's already pending and on time. Called by the
+  // once-a-minute cron watchdog and by reads that find a stale snapshot.
+  async ensureRefreshLoop(): Promise<void> {
+    const at = await this.ctx.storage.getAlarm();
+    if (at != null && at > Date.now() - LOOP_STALL_MS) return;
+    await this.ctx.storage.setAlarm(nextBeat(Date.now()));
+    // One-time cleanup: the cron-era snapshot lived under two keys.
+    await this.ctx.storage.delete(['predictions:all', 'predictions:ts']);
+  }
+
   async getPredictions(codes?: string[]): Promise<PredictionsSnapshot | undefined> {
-    const stored = await this.ctx.storage.get(['predictions:all', 'predictions:ts']);
-    const all = stored.get('predictions:all') as Train[] | undefined;
-    if (!all) return undefined;
+    const snap = await this.ctx.storage.get<PredictionsSnapshot>('predictions');
+    if (!snap) return undefined;
+    if (Date.now() - snap.ts > LOOP_STALL_MS) await this.ensureRefreshLoop();
+    return { ...snap, trains: codes ? filterTrains(snap.trains, codes) : snap.trains };
+  }
+
+  // One DO round trip for the arrivals board. A cold DO (first deploy) builds
+  // the snapshot inline; incidents are best-effort, as they were client-side.
+  async getBoard(codes: string[]): Promise<Board> {
+    const stored = await this.ctx.storage.get(['predictions', 'incidents']);
+    let snap = stored.get('predictions') as PredictionsSnapshot | undefined;
+    if (!snap) {
+      snap = await this.refreshSnapshot();
+      await this.ensureRefreshLoop();
+    } else if (Date.now() - snap.ts > LOOP_STALL_MS) {
+      await this.ensureRefreshLoop();
+    }
+    const incidents = (stored.get('incidents') as Incident[] | undefined)
+      ?? await this.refreshIncidents().catch(() => []);
     return {
-      trains: codes ? filterTrains(all, codes) : all,
-      // 0 for a snapshot written before ts existed; the handler omits the
-      // header then, and the next refresh stamps it.
-      ts: (stored.get('predictions:ts') as number | undefined) ?? 0,
+      trains: filterTrains(snap.trains, codes),
+      incidents,
+      ts: snap.ts,
+      nextInMs: Math.max(0, snap.nextTs - Date.now()),
     };
   }
   async getIncidents(): Promise<Incident[] | undefined> {
@@ -128,12 +196,23 @@ export class WmataCache extends DurableObject<Env> {
     return all && codes ? filterElevator(all, codes) : all;
   }
 
-  // Fetch GTFS-RT (fallback: legacy GetPrediction), store the snapshot plus
-  // its generation timestamp. Returns the subset for `codes` so the cold-DO
-  // fetch path gets its data in one round trip; cron callers pass no codes and
-  // get an empty array — they only care that the snapshot landed, and the full
-  // ~85 KiB list shouldn't ride back on every 20s refresh RPC.
+  // Cold-DO path for the legacy /predictions route: returns the subset for
+  // `codes` so it gets its data in one round trip.
   async refreshPredictions(codes?: string[]): Promise<Train[]> {
+    const snap = await this.refreshSnapshot();
+    return codes ? filterTrains(snap.trains, codes) : [];
+  }
+
+  refreshSnapshot(): Promise<PredictionsSnapshot> {
+    this.inflight ??= this.buildSnapshot().finally(() => { this.inflight = undefined; });
+    return this.inflight;
+  }
+
+  // Fetch GTFS-RT (fallback: legacy GetPrediction) and store the snapshot as
+  // one key — one row written per refresh. `nextTs` assumes the next refresh
+  // starts on the next beat and takes as long as this one did.
+  private async buildSnapshot(): Promise<PredictionsSnapshot> {
+    const start = Date.now();
     // codeToName maps a destination station code → canonical name (for the
     // GTFS-RT dest column). If stations is cold, refresh it once on the way
     // through. The fuzzy index is only needed on the GetPrediction fallback
@@ -172,8 +251,10 @@ export class WmataCache extends DurableObject<Env> {
         await fetchAllPredictions(this.env), codeToName, buildFuzzyIndex(stationsForFuzzy));
     }
 
-    await this.ctx.storage.put({ 'predictions:all': trains, 'predictions:ts': Date.now() });
-    return codes ? filterTrains(trains, codes) : [];
+    const ts = Date.now();
+    const snap: PredictionsSnapshot = { trains, ts, nextTs: nextBeat(start) + (ts - start) };
+    await this.ctx.storage.put('predictions', snap);
+    return snap;
   }
   async refreshIncidents(): Promise<Incident[]> {
     const incidents = await fetchIncidents(this.env);
@@ -785,9 +866,9 @@ function enrichPredictions(
 // The fetch handlers fall back to a DO refresh RPC when the DO is empty
 // (first deploy, migration). Without a guard, a burst of concurrent requests
 // in that window would each trigger a WMATA fetch inside the DO. Deduping per
-// isolate collapses the burst at each POP to one refresh per kind; the 5s edge
-// cache and the cron pre-warm (which repopulates the DO within a minute) cover
-// the rest.
+// isolate collapses the burst at each POP to one refresh per kind; the DO's
+// alarm loop and the cron pre-warms (which repopulate it within seconds to a
+// minute) cover the rest. /board dedupes inside the DO instead.
 const inflightRefresh = new Map<string, Promise<unknown>>();
 function dedupeRefresh<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const existing = inflightRefresh.get(key) as Promise<T> | undefined;
@@ -847,22 +928,13 @@ export default {
     // GTFS-RT feeds (doing that here is what silently killed refreshes).
     // waitUntil keeps the invocation alive past the scheduled() return.
     switch (controller.cron) {
-      case '* * * * *': {
-        // Cloudflare cron's minimum granularity is 1 min; for 20s polling we
-        // fan out 3 refreshes inside one minute via setTimeout. Total
-        // wallclock ~40-46s (each refresh ~2s), leaving headroom before the
-        // next tick. A fresh stub per call sidesteps stale-stub errors across
-        // the 20s gaps.
-        const fanOut = async (): Promise<void> => {
-          await cache(env).refreshPredictions();
-          await new Promise((r) => setTimeout(r, 20_000));
-          await cache(env).refreshPredictions();
-          await new Promise((r) => setTimeout(r, 20_000));
-          await cache(env).refreshPredictions();
-        };
-        ctx.waitUntil(fanOut().catch((e) => console.error('predictions refresh failed', e)));
+      case '* * * * *':
+        // Watchdog only: predictions refresh on the DO's own 5s alarm loop
+        // (cron can't go below 1 min). This re-arms the loop if it lapsed.
+        ctx.waitUntil(
+          cache(env).ensureRefreshLoop()
+            .catch((e) => console.error('refresh loop watchdog failed', e)));
         return;
-      }
       case '*/5 * * * *':
         ctx.waitUntil(
           Promise.all([cache(env).refreshIncidents(), cache(env).refreshElevator()])
@@ -913,6 +985,17 @@ export default {
         return json(incidents, { cacheControl: CC_INCIDENTS });
       }
 
+      const boardMatch = /^board\/([^/]+)\/?$/.exec(path);
+      if (boardMatch) {
+        const codes = parseCodes(boardMatch[1]);
+        if (!codes) return json({ error: 'invalid_codes' }, { status: 400 });
+        // no-store: clients time each poll to land just after the next
+        // snapshot, so a cached copy would only hand them the one they have.
+        return json(await c.getBoard(codes), { cacheControl: 'no-store' });
+      }
+
+      // Superseded by /board for the arrivals board; kept for browsers still
+      // running a frontend build from before it existed.
       const predMatch = /^predictions\/([^/]+)\/?$/.exec(path);
       if (predMatch) {
         const codes = parseCodes(predMatch[1]);
@@ -967,6 +1050,6 @@ export default {
 export {
   parseCodes, subPath, stationCode,
   parseTripUpdateFeed, parseVehiclePositionFeed, tripsToTrains,
-  fuzzyMatch, buildFuzzyIndex, adaptStations,
+  fuzzyMatch, buildFuzzyIndex, adaptStations, nextBeat,
 };
 export type { Station, Train, GtfsTrip };

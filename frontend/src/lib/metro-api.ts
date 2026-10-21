@@ -26,24 +26,19 @@ export function getStations(signal?: AbortSignal): Promise<Station[]> {
   return getJson<Station[]>('stations', signal);
 }
 
-// generatedAt (X-Data-Timestamp, epoch ms) is when the proxy built the
-// snapshot the rows came from — their `min` values are baked in at that
-// moment, so it's the honest "updated" time. Null if the proxy didn't send it.
-export interface PredictionsResult { trains: Train[]; generatedAt: number | null }
-
-export async function getPredictions(
-  codes: string[], signal?: AbortSignal,
-): Promise<PredictionsResult> {
-  const path = `predictions/${codes.join(',')}`;
-  const r = await fetch(`${BASE}/${path}`, { signal, headers: { Accept: 'application/json' } });
-  if (!r.ok) throw new Error(`HTTP ${r.status} for ${path}`);
-  const trains = (await r.json()) as Train[];
-  const ts = Number(r.headers.get('X-Data-Timestamp'));
-  return { trains, generatedAt: Number.isFinite(ts) && ts > 0 ? ts : null };
+// Everything the arrivals board polls for, in one request. generatedAt (epoch
+// ms) is when the proxy built the predictions snapshot — the rows' `min`
+// values are baked in at that moment, so it's the honest "updated" time.
+// nextInMs is how long until the proxy's next snapshot is due, so the caller
+// can poll just after it lands.
+export interface BoardResult {
+  trains: Train[]; incidents: Incident[]; generatedAt: number; nextInMs: number;
 }
 
-export function getIncidents(signal?: AbortSignal): Promise<Incident[]> {
-  return getJson<Incident[]>('incidents', signal);
+export async function getBoard(codes: string[], signal?: AbortSignal): Promise<BoardResult> {
+  const b = await getJson<{ trains: Train[]; incidents: Incident[]; ts: number; nextInMs: number }>(
+    `board/${codes.join(',')}`, signal);
+  return { trains: b.trains, incidents: b.incidents, generatedAt: b.ts, nextInMs: b.nextInMs };
 }
 
 export function getStationTimes(codes: string[], signal?: AbortSignal): Promise<StationTimes> {

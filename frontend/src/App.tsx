@@ -8,7 +8,16 @@ import {
 import * as api from './lib/metro-api';
 import { parseStationSlug, stationFromSlug, stationPath, SLUG_ALIASES } from './lib/urls';
 
-const REFRESH_MS = 10_000;
+// Board polling. The proxy refreshes its snapshot every ~5s and says when the
+// next one is due (nextInMs); polling POLL_MARGIN_MS after that keeps the board
+// about one refresh behind WMATA at one request per snapshot.
+const POLL_MARGIN_MS = 1_000;   // slack for jitter in how long a refresh takes
+const POLL_MIN_MS = 1_000;
+const POLL_MAX_MS = 15_000;
+const RETRY_MAX_MS = 30_000;    // failures back off 2s, 4s, 8s… up to this
+// Background tabs keep a slow poll so the board isn't stale (and flashing
+// "unable to load") when you come back; returning refetches immediately.
+const HIDDEN_POLL_MS = 60_000;
 // How old the last successful fetch may get before we stop trusting the board
 // and show an "unable to load" state instead of stale arrivals.
 const STALE_MS = 120_000;
@@ -582,36 +591,78 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  const load = useCallback(async () => {
-    if (!station) return;
+  // Fetches the board once. Resolves to the snapshot's timing for the poll
+  // loop to schedule from, 'failed', or null if a newer load superseded it.
+  const load = useCallback(async (): Promise<api.BoardResult | 'failed' | null> => {
+    if (!station) return null;
     const id = ++reqId.current;
     try {
-      const [pred, inc] = await Promise.all([
-        api.getPredictions(station.codes),
-        api.getIncidents().catch(() => [] as Incident[]),
-      ]);
-      if (id !== reqId.current) return;
-      setTrains(pred.trains);
-      setIncidents(inc.filter((i) => i.lines.some((l) => station.lines.includes(l))));
-      // Prefer the server's snapshot-built time: "updated Xs ago" then reflects
-      // the age of the data, not of the fetch — a proxy stuck re-serving an old
+      const board = await api.getBoard(station.codes);
+      if (id !== reqId.current) return null;
+      setTrains(board.trains);
+      setIncidents(board.incidents.filter((i) => i.lines.some((l) => station.lines.includes(l))));
+      // The server's snapshot-built time: "updated Xs ago" then reflects the
+      // age of the data, not of the fetch — a proxy stuck re-serving an old
       // snapshot ages visibly instead of masquerading as live.
-      setUpdatedAt(pred.generatedAt ?? Date.now());
+      setUpdatedAt(board.generatedAt);
       setFailing(false);
+      return board;
     } catch {
       // Keep the last-good trains/incidents on screen; just flag the failure.
       // Staleness (updatedAt aging past STALE_MS) decides when to hide them.
-      if (id !== reqId.current) return;
+      if (id !== reqId.current) return null;
       setFailing(true);
+      return 'failed';
     }
   }, [station]);
 
+  // Poll loop: each fetch schedules the next one for just after the proxy's
+  // next snapshot is due, rather than on a fixed interval. `gen` retires the
+  // old chain whenever a new one starts (manual refresh, tab shown again), so
+  // two chains never run at once. Counters live here so they reset per station.
+  const kickRef = useRef<() => void>(undefined);
   useEffect(() => {
-    // First fetch via a 0ms timeout: load()'s state writes all land after its
-    // awaits, but scheduling it keeps this effect free of synchronous setState.
-    const t = setTimeout(load, 0);
-    const iv = setInterval(load, REFRESH_MS);
-    return () => { clearTimeout(t); clearInterval(iv); };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let gen = 0;
+    let failures = 0;
+    let lastTs: number | null = null;
+    let repeats = 0;
+    const delayFor = (r: api.BoardResult | 'failed'): number => {
+      if (r === 'failed') {
+        failures++;
+        return Math.min(1_000 * 2 ** failures, RETRY_MAX_MS);
+      }
+      failures = 0;
+      // Same snapshot as last time: the proxy's refresh is running late, so
+      // back off instead of re-polling every POLL_MIN_MS.
+      repeats = r.generatedAt === lastTs ? repeats + 1 : 0;
+      lastTs = r.generatedAt;
+      if (document.hidden) return HIDDEN_POLL_MS;
+      if (repeats > 0) return Math.min(POLL_MIN_MS * 2 ** repeats, POLL_MAX_MS);
+      return Math.min(Math.max(r.nextInMs + POLL_MARGIN_MS, POLL_MIN_MS), POLL_MAX_MS);
+    };
+    const run = async (g: number) => {
+      const r = await load();
+      if (g !== gen) return;
+      timer = setTimeout(() => run(g), r === null ? POLL_MAX_MS : delayFor(r));
+    };
+    // Via a 0ms timeout: load()'s state writes all land after its awaits, but
+    // scheduling it keeps this effect free of synchronous setState.
+    const kick = () => {
+      clearTimeout(timer);
+      const g = ++gen;
+      timer = setTimeout(() => run(g), 0);
+    };
+    const onVisibility = () => { if (!document.hidden) kick(); };
+    kickRef.current = kick;
+    kick();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      gen++;
+      clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+      kickRef.current = undefined;
+    };
   }, [load]);
 
   // Lazily load the Info tab's data the first time it's opened for a station.
@@ -649,7 +700,7 @@ export default function App() {
       window.history.pushState({}, '', path);
     }
   };
-  const refresh = () => { setSpin((s) => s + 1); load(); };
+  const refresh = () => { setSpin((s) => s + 1); kickRef.current?.(); };
 
   // Browser back/forward → re-resolve the URL and update the active station.
   // Uses the latest `stations` list so navigation reflects live data once it

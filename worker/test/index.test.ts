@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   parseCodes, subPath, stationCode,
   parseTripUpdateFeed, parseVehiclePositionFeed, tripsToTrains,
-  fuzzyMatch, buildFuzzyIndex, adaptStations,
+  fuzzyMatch, buildFuzzyIndex, adaptStations, nextBeat,
   type GtfsTrip, type Station,
 } from '../src/index';
 
@@ -238,5 +238,15 @@ describe('adaptStations', () => {
       raw({ Code: 'X99', Name: 'Ghost', LineCode1: 'ZZ' }),   // no valid lines
     ]);
     expect(out.map((s) => s.name)).toEqual(['Mt Vernon Sq']);
+  });
+});
+
+describe('nextBeat', () => {
+  it('rounds up to the next 5s wall-clock boundary', () => {
+    expect(nextBeat(1_000_001_000)).toBe(1_000_005_000);
+    expect(nextBeat(1_000_004_999)).toBe(1_000_005_000);
+  });
+  it('moves a full interval ahead when already on a boundary', () => {
+    expect(nextBeat(1_000_000_000)).toBe(1_000_005_000);
   });
 });
