@@ -38,7 +38,9 @@ jobs:
 
   frontend:
     name: Frontend → Firebase Hosting
-    needs: check
+    # After the Worker: the Worker keeps old routes working for cached
+    # frontends, but a new frontend may call routes only the new Worker has.
+    needs: [check, worker]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
