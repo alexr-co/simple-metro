@@ -135,6 +135,37 @@ body {
 .mx-board { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .mx-plat-block { border-top: 1.5px solid var(--rule-strong); }
 
+/* Scrollbars for the two internal scrollers. Windows draws chunky grey
+   always-on scrollbars by default (macOS hides its overlay ones), so give
+   them a thin thumb in the theme's own ink over a transparent track.
+   The thumb stays invisible until the pointer is over the scroller (or focus
+   is inside it), so it reads like an overlay scrollbar; the gutter is still
+   reserved, so nothing shifts when it appears. scrollbar-color interpolates,
+   so the thumb fades in and out rather than popping. */
+.mx-board, .mx-selectmenu {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  transition: scrollbar-color 0.3s ease;
+}
+.mx-board:hover, .mx-board:focus-within,
+.mx-selectmenu:hover, .mx-selectmenu:focus-within {
+  scrollbar-color: var(--muted) transparent;
+}
+/* Fallback for WebKit browsers without scrollbar-color (older Safari).
+   Chromium ignores these when the standard properties above apply. */
+@supports not (scrollbar-color: auto) {
+  .mx-board::-webkit-scrollbar, .mx-selectmenu::-webkit-scrollbar { width: 8px; }
+  .mx-board::-webkit-scrollbar-track, .mx-selectmenu::-webkit-scrollbar-track { background: transparent; }
+  .mx-board::-webkit-scrollbar-thumb, .mx-selectmenu::-webkit-scrollbar-thumb {
+    background: transparent; border-radius: 4px;
+    border: 2px solid transparent; background-clip: padding-box;
+  }
+  .mx-board:hover::-webkit-scrollbar-thumb, .mx-board:focus-within::-webkit-scrollbar-thumb,
+  .mx-selectmenu:hover::-webkit-scrollbar-thumb, .mx-selectmenu:focus-within::-webkit-scrollbar-thumb {
+    background: var(--muted);
+  }
+}
+
 /* Incoming board content fades in so a station switch reads as a transition
    instead of a pop. Runs only when the element mounts (fresh station / tab /
    alert box); the 10s data refresh reuses the same DOM, so no re-flash. */
